@@ -1,6 +1,6 @@
 import SwiftUI
 
-enum ReaderMode: String, CaseIterable, Codable {
+enum ReaderMode: String, CaseIterable, Codable, Sendable {
     case text, audio, video
 
     var title: String {
@@ -98,6 +98,11 @@ struct SmartReadApp: App {
                     .keyboardShortcut("h", modifiers: [.command, .shift])
             }
             CommandMenu("阅读") {
+                Button("临时朗读选中句子") {
+                    if let sentence = reader.selectedPreviewSentence { speech.preview(sentence) }
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(mode != .text || reader.selectedPreviewSentence == nil || sheet != nil)
                 Button("翻译选区") { reader.lookUp(.translation) }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                     .disabled(mode != .text || !reader.hasEnglishSelection || sheet != nil)
@@ -226,7 +231,7 @@ enum ReadingFontSize {
 }
 
 enum ReaderSheet: String, Identifiable {
-    case importArticle, history, audioHistory, videoHistory, readingFeedback, favorites
+    case importArticle, history, audioHistory, videoHistory, readingFeedback, favorites, listeningMarks
     var id: String { rawValue }
 }
 
@@ -244,8 +249,6 @@ struct ReaderWindow: View {
     @Environment(\.openURL) private var openURL
     @AppStorage("audioStudyShowsSubtitles") private var showsSubtitles = true
     @GestureState private var dividerOffset: CGFloat = 0
-    @State private var copied = false
-    @State private var showsStudyTools = false
     @State private var showsModeMenu = false
     @State private var showsDisplayOptions = false
     @State private var editingCue: AudioStudyCue?
@@ -253,12 +256,18 @@ struct ReaderWindow: View {
     @State private var pdfBookPanel: PDFBookPanel?
     @State private var dropTarget = false
     @State private var subtitleAssistant = AudioSubtitleAssistant()
+    @State private var pendingMarkedSpeech: (version: UUID, sentence: TextExcerpt)?
 
     private var interfaceScale: CGFloat { preferences.interfaceSize.scale }
     private static let brandIcon: NSImage? = {
         let url = Bundle.main.url(forResource: "SmartRead", withExtension: "icns")
             ?? Bundle.module.url(forResource: "SmartRead", withExtension: "icns")
         return url.flatMap { NSImage(contentsOf: $0) }
+    }()
+    private static let markConfirmationSound: NSSound? = {
+        guard let url = Bundle.module.url(forResource: "ListeningMark", withExtension: "wav"),
+              let sound = NSSound(contentsOf: url, byReference: true) else { return nil }
+        return sound
     }()
     private var inAudioMode: Bool { mode == .audio }
     private var inVideoMode: Bool { mode == .video }
@@ -275,28 +284,42 @@ struct ReaderWindow: View {
                 columns(layout: layout, windowWidth: width, article: article, articleVersion: articleVersion)
                 switch mode {
                 case .audio:
-                    if audio.entry != nil { AudioPlayerBar(model: audio) }
+                    if audio.entry != nil {
+                        AudioPlayerBar(model: audio, captureMark: captureListeningMark, trackedReplay: trackedReplay)
+                    }
                 case .text:
-                    if speech.current != nil { SpeechPlayerBar(speech: speech) }
+                    if speech.current != nil {
+                        SpeechPlayerBar(speech: speech, captureMark: captureListeningMark, trackedReplay: trackedReplay)
+                    }
                 case .video:
-                    VideoPlayerBar(model: video, controller: video.playerController)
+                    VideoPlayerBar(model: video, controller: video.playerController,
+                                   captureMark: captureListeningMark, trackedReplay: trackedReplay)
                 }
             }
         }
         .foregroundStyle(ReaderPalette.ink)
         .background(ReaderPalette.paper)
+        .background(PlaybackShortcutMonitor(action: readingShortcut))
         .tint(ReaderPalette.primaryButton)
         .task {
             speech.warmUp()
             await reader.connect()
         }
-        .onChange(of: articleVersion) { speech.stop() }
+        .onChange(of: articleVersion) { _, version in
+            speech.stop()
+            if let pending = pendingMarkedSpeech, pending.version == version {
+                playMarkedSentence(pending.sentence)
+            }
+            pendingMarkedSpeech = nil
+        }
+        .onChange(of: speech.error) { _, message in
+            if mode == .text, speech.current == nil, let message { reader.notice = message }
+        }
         .onChange(of: audio.entry?.id) { subtitleAssistant.clear() }
         .onChange(of: showsSubtitles) {
             if !showsSubtitles { subtitleAssistant.clear() }
         }
         .onChange(of: mode) { previous, next in
-            showsStudyTools = false
             switch previous {
             case .text: speech.pause()
             case .audio: audio.pause(); dropTarget = false
@@ -321,6 +344,14 @@ struct ReaderWindow: View {
             case .videoHistory: VideoHistorySheet(model: video)
             case .readingFeedback: ReadingFeedbackSheet(reader: reader)
             case .favorites: ArticleFavoritesSheet(reader: reader)
+            case .listeningMarks:
+                ListeningMarkSheet(rows: reader.listeningMarks.rows(for: mode, materialID: listeningMaterialID),
+                                   issue: reader.listeningMarks.issue,
+                                   passage: { liveAudioCue(for: $0)?.text ?? $0.passage },
+                                   location: { mark in
+                    liveAudioCue(for: mark).map { audioTimeText($0.start) } ?? mark.locationLabel
+                }, open: reviewListeningMark, remove: reader.listeningMarks.remove,
+                                   isFavorite: isListeningFavorite, toggleFavorite: toggleListeningFavorite)
             }
         }
         .sheet(item: $editingCue) { cue in
@@ -366,6 +397,12 @@ struct ReaderWindow: View {
         .environment(\.readerInterfaceScale, interfaceScale)
     }
 
+    private func readingShortcut(_ shortcut: PlaybackShortcut) -> (() -> Void)? {
+        guard shortcut == .toggle, mode == .text, speech.current == nil,
+              sheet == nil, pdfBookPanel == nil, let sentence = reader.selectedPreviewSentence else { return nil }
+        return { speech.preview(sentence) }
+    }
+
     private func paneLayout(windowWidth: CGFloat, inspectorDelta: CGFloat = 0) -> ReaderPaneLayout {
         ReaderPaneLayout(windowWidth: windowWidth, inspectorFraction: preferences.inspectorFraction,
                          bodyWidth: preferences.bodyWidth, inspectorDelta: inspectorDelta)
@@ -383,7 +420,8 @@ struct ReaderWindow: View {
                     AudioStudyContent(model: audio, fontSize: fontSize, showsSubtitles: showsSubtitles,
                                       maskOpacity: preferences.listeningMaskOpacity,
                                       highlightsSentence: preferences.highlightsSpokenSentence,
-                                      selection: subtitleAssistant.selection, lookUp: lookUpSubtitle, edit: editCue)
+                                      selection: subtitleAssistant.selection, markedCues: markedAudioCues,
+                                      lookUp: lookUpSubtitle, edit: editCue)
                         .frame(width: layout.articleContentWidth)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .overlay {
@@ -403,6 +441,8 @@ struct ReaderWindow: View {
                 }
                 if inVideoMode {
                     VideoStudyContent(model: video, fontSize: fontSize, subtitleWidth: layout.articleContentWidth,
+                                      clickWholeSentence: preferences.clickWholeSentence,
+                                      listeningMarks: currentListeningMarks,
                                       chooseVideo: chooseVideo, openHistory: { sheet = .videoHistory })
                 }
             }
@@ -438,11 +478,14 @@ struct ReaderWindow: View {
                     .accessibilityHidden(mode != .text)
                 if inAudioMode {
                     AudioStudyInspector(model: audio, assistant: subtitleAssistant, reader: reader,
-                                        fontSize: fontSize, showsSubtitles: $showsSubtitles, edit: editCue,
+                                        fontSize: fontSize, showsSubtitles: $showsSubtitles,
+                                        clickWholeSentence: preferences.$clickWholeSentence, edit: editCue,
                                         locateQuestionSource: locateQuestionSource)
                 }
                 if inVideoMode {
-                    VideoStudyInspector(model: video, reader: reader, locateQuestionSource: locateQuestionSource)
+                    VideoStudyInspector(model: video, reader: reader, clickWholeSentence: preferences.$clickWholeSentence,
+                                        listeningMarks: currentListeningMarks,
+                                        locateQuestionSource: locateQuestionSource)
                 }
             }
             .frame(width: layout.inspectorWidth)
@@ -454,6 +497,7 @@ struct ReaderWindow: View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 12 * interfaceScale) {
                 toolbarPrimary
+                listeningMarkButton
                 Spacer(minLength: 8)
                 displayControls(articleWidthPercent: articleWidthPercent)
                 modeButton(showTitle: true)
@@ -461,6 +505,7 @@ struct ReaderWindow: View {
             }
             HStack(spacing: 10 * interfaceScale) {
                 toolbarPrimary
+                listeningMarkButton
                 Spacer(minLength: 6)
                 displayControls(articleWidthPercent: articleWidthPercent)
                 modeButton(showTitle: false)
@@ -473,7 +518,10 @@ struct ReaderWindow: View {
                     modeButton(showTitle: windowWidth >= 900)
                     settingsLink(showStatus: false)
                 }
-                displayControls(articleWidthPercent: articleWidthPercent)
+                HStack(spacing: 10 * interfaceScale) {
+                    displayControls(articleWidthPercent: articleWidthPercent)
+                    listeningMarkButton
+                }
             }
         }
         .padding(.leading, 78)
@@ -566,6 +614,18 @@ struct ReaderWindow: View {
         }
     }
 
+    private var listeningMarkButton: some View {
+        let count = currentListeningMarks.count
+        return Button { sheet = .listeningMarks } label: {
+            Label(count > 0 ? "听力标记 \(count)" : "听力标记", systemImage: "bookmark")
+        }
+        .buttonStyle(ReaderButtonStyle(prominent: false, compact: true, scale: 1.6))
+        .fixedSize()
+        .accessibilityIdentifier("openListeningMarks")
+        .help(reader.listeningMarks.issue ?? "双按 ↓ 或按 M 标记当前句，点击复盘")
+        .disabled(listeningMaterialID == nil)
+    }
+
     private func displayControls(articleWidthPercent: Int) -> some View {
         HStack(spacing: 10 * interfaceScale) {
             if preferences.showsToolbarSliders { fontSlider }
@@ -608,10 +668,12 @@ struct ReaderWindow: View {
 
     private func lookUpSubtitle(_ cueID: UUID, _ target: SubtitleWord) {
         guard inAudioMode, showsSubtitles, let entry = audio.entry,
-              let selection = AudioSubtitleSelection(entry: entry, cueID: cueID, target: target) else { return }
+              let selection = AudioSubtitleSelection(entry: entry, cueID: cueID, target: target,
+                                                     wholeSentence: preferences.clickWholeSentence
+                                                         && !target.text.contains(where: \.isWhitespace)) else { return }
         if audio.isPlaying { audio.pause() }
         audio.selectQuestionReference(selection)
-        subtitleAssistant.show(.word, for: selection, using: reader)
+        subtitleAssistant.select(selection, using: reader)
     }
 
     private func settingsLink(showStatus: Bool) -> some View {
@@ -722,6 +784,7 @@ struct ReaderWindow: View {
                     version: version,
                     fontSize: fontSize,
                     marks: reader.marks,
+                    listeningMarks: mode == .text ? reader.textListeningMarks : [],
                     inlineTranslation: reader.inlineTranslation,
                     jump: reader.jump,
                     listeningFocus: speech.focusRequest.map { request in
@@ -761,7 +824,13 @@ struct ReaderWindow: View {
                         speech.pause()
                         reader.translateSentence(containing: excerpt)
                     },
-                    onSpeakSelection: playSelection,
+                    onSpeakSelection: { selection in
+                        if let sentence = reader.previewSentence(selection) { speech.preview(sentence) }
+                    },
+                    onCancelMark: { id in
+                        reader.listeningMarks.remove(id)
+                        if let issue = reader.listeningMarks.issue { reader.notice = issue }
+                    },
                     onWordStudy: { kind, excerpt in
                         speech.pause()
                         reader.openStudy(kind, at: excerpt)
@@ -806,7 +875,7 @@ struct ReaderWindow: View {
 
     private func playArticle(fromHere: Bool) {
         let plan = reader.articleForListening(fromHere: fromHere)
-        speech.start(plan.sentences, at: plan.start)
+        speech.start(plan.sentences, at: plan.start, stopsAfterSentence: !fromHere)
     }
 
     private func playSelection(_ excerpt: TextExcerpt) {
@@ -816,88 +885,239 @@ struct ReaderWindow: View {
     }
 
     private var inspector: some View {
-        let analysisBelowTranslation = reader.study == nil && reader.lookup?.kind == .translation
-            && (reader.selection == nil || reader.selection?.range == reader.lookup?.excerpt.range)
-        return ReaderInspector {
-            VStack(alignment: .leading, spacing: 11) {
-                inspectorHeading
-                AssistantActions(selected: textAssistantAction, available: textAssistantAvailable,
-                                 perform: performTextAssistantAction)
-                studyMenu
-                HStack(spacing: 8) {
-                    action(.translation, shortcut: "⇧⌘T")
-                    if !analysisBelowTranslation {
-                        action(.analysis, shortcut: "⇧⌘G")
-                    }
-                }
-                Text(!reader.hasEnglishReadingText || (reader.selection != nil && !reader.hasEnglishSelection)
-                     ? "学习助手适用于英文正文"
-                     : reader.selection.map { "已选中 \($0.text.count.formatted()) 个字符" }
-                         ?? (preferences.clickWholeSentence ? "单击正文翻译整句" : "点词查词，拖选查询短语"))
-                    .font(.system(size: max(11, 12 * interfaceScale)))
-                    .foregroundStyle(ReaderPalette.muted)
-                    .accessibilityIdentifier("selectionStatus")
-                if let status = reader.hintStatus {
-                    Button {
-                        reader.openStudy(.hints)
-                    } label: {
-                        Label(status, systemImage: StudyKind.hints.symbol)
-                            .font(.system(size: 12))
-                    }
-                    .buttonStyle(.link)
-                    .accessibilityIdentifier("assistStatus")
-                }
-            }
+        AssistantInspector(reader: reader, mode: .text, materialID: reader.questionMaterialID,
+                           locate: locateQuestionSource, isActive: mode == .text,
+                           manualSelection: reader.questionSelection, visiblePassage: textAssistantPassage,
+                           sentenceFavorite: reader.sentenceFavoriteExcerpt.map { .init(reader: reader, excerpt: $0) },
+                           reference: { reader.assistantQuestionReference(currentOnly: $0, spoken: speech.current) }) {
+            textAssistantTools
         } content: {
-            if reader.shownFavorite == nil, let source = reader.assistantSource {
-                AssistantSourceRow(sentence: source.text) { reader.locate(source.range) }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 14)
-            }
             if let favorite = reader.shownFavorite {
                 favoriteCard(favorite).id(favorite.id)
             } else if let study = reader.study {
                 StudyCard(study: study, reader: reader, fontSize: fontSize,
                           retry: { reader.openStudy(study.kind, at: study.request?.target) },
-                          dismiss: { reader.dismissStudy() },
-                          reveal: { reader.revealStudyAnswer() },
-                          locate: { reader.locate($0) },
-                          detailedAnalysis: { reader.lookUp(.analysis, excerpt: $0) })
+                          dismiss: { reader.dismissStudy() }, reveal: { reader.revealStudyAnswer() },
+                          locate: { reader.locate($0) }, detailedAnalysis: { reader.lookUp(.analysis, excerpt: $0) })
                     .id(study.id)
             } else if let lookup = reader.lookup {
-                VStack(spacing: 0) {
-                    lookupCard(lookup)
-                    if lookup.kind == .translation {
-                        translationAnalysisSection(for: lookup)
-                    }
-                }
-                .id(lookup)
+                textAssistantResults(lookup)
             } else {
-                VStack(alignment: .leading, spacing: 9) {
-                    Image(systemName: "character.book.closed")
-                        .font(.system(size: 20, weight: .medium))
-                        .foregroundStyle(ReaderPalette.accent)
-                    Text(!reader.hasEnglishReadingText
-                         ? "本页可直接阅读。学习助手适用于英文正文。" : "查词、译文和解析会显示在这里。")
-                        .font(.system(size: 15, weight: .medium))
-                    if reader.article.body == Article.sample.body {
-                        Text("试着点示例里两处 bank，看看同一个词在不同句子里的意思。")
-                            .font(.system(size: 13))
-                            .lineSpacing(4)
-                            .foregroundStyle(ReaderPalette.muted)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(22)
-            }
-        } footer: {
-            AssistantQuestionPanel(reader: reader, mode: .text, materialID: reader.questionMaterialID,
-                                   locate: locateQuestionSource, isActive: mode == .text,
-                                   manualSelection: reader.questionSelection) { currentOnly in
-                reader.assistantQuestionReference(currentOnly: currentOnly, spoken: speech.current)
+                Text(!reader.hasEnglishReadingText ? "本页可直接阅读。学习助手适用于英文正文。"
+                     : preferences.clickWholeSentence ? "点击正文查看整句翻译。"
+                     : "点击单词查看词义和例句译文。")
+                    .font(.system(size: 13))
+                    .foregroundStyle(ReaderPalette.muted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(18)
             }
         }
-        .onChange(of: reader.lookup) { copied = false }
+    }
+
+    private var textAssistantPassage: String? {
+        guard reader.study == nil, reader.shownFavorite == nil, let request = reader.assistantTranslation else { return nil }
+        return reader.assistantDisplayExcerpt(request.excerpt).text
+    }
+
+    private func textAssistantResults(_ lookup: LookupRequest) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if lookup.kind == .word {
+                AssistantSectionTitle(title: "词义")
+                Text(lookup.excerpt.text)
+                    .font(.system(size: 25, weight: .semibold, design: .serif))
+                    .textSelection(.enabled)
+                textLookupAnswer(lookup, wordOnly: true)
+                if let draft = reader.lookupFavorite {
+                    LearningFavoriteButton(reader: reader, draft: draft, controlScale: 1)
+                }
+                Divider()
+            }
+
+            if let translation = reader.assistantTranslation {
+                let excerpt = reader.assistantDisplayExcerpt(translation.excerpt)
+                let relative = lookup.excerpt.range.location - excerpt.range.location
+                let focus = lookup.kind == .word && relative >= 0
+                    ? NSRange(location: relative, length: lookup.excerpt.range.length) : nil
+                AssistantPassage(sentence: excerpt.text, focus: focus)
+                if lookup.kind == .word {
+                    AssistantResult(result: reader.wordTranslation.result, fontSize: assistantFontSize,
+                                    cancel: reader.wordTranslation.cancel, retry: reader.retryWordTranslation)
+                } else {
+                    textLookupAnswer(lookup)
+                }
+                translationAnalysisSection(for: translation)
+            } else if lookup.kind == .analysis {
+                AssistantSectionTitle(title: "语法解析")
+                Text(reader.assistantDisplayExcerpt(lookup.excerpt).text)
+                    .font(.system(size: 17, design: .serif)).textSelection(.enabled)
+                textLookupAnswer(lookup)
+                if let draft = reader.lookupFavorite {
+                    LearningFavoriteButton(reader: reader, draft: draft, controlScale: 1)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+    }
+
+    private var assistantFontSize: Double { max(15, min(28, fontSize * 0.72)) }
+
+    private func textLookupAnswer(_ lookup: LookupRequest, wordOnly: Bool = false) -> some View {
+        let answer = wordOnly ? reader.answer.components(separatedBy: .newlines)
+            .filter { !$0.hasPrefix("搭配：") }.joined(separator: "\n") : reader.answer
+        return Group {
+            if !answer.isEmpty {
+                AnswerText(answer: answer, fontSize: assistantFontSize)
+                    .accessibilityIdentifier("lookupAnswer")
+            }
+            if reader.isLookingUp {
+                HStack {
+                    lookupProgress(answer)
+                    Spacer()
+                    Button("停止", action: reader.cancelLookup).buttonStyle(.link).font(.caption)
+                }
+            } else if let error = reader.lookupError {
+                Text(error).font(.caption).foregroundStyle(ReaderPalette.warning)
+                Button("重试") { reader.lookUp(lookup.kind, excerpt: lookup.excerpt) }.buttonStyle(.link)
+            } else if answer.isEmpty {
+                Button("重新查询") { reader.lookUp(lookup.kind, excerpt: lookup.excerpt) }.buttonStyle(.link)
+            }
+        }
+    }
+
+    private var listeningMaterialID: String? {
+        switch mode {
+        case .text:
+            if let pdf = reader.article.pdfPage { return "book:\(pdf.book.id)" }
+            return reader.questionMaterialID
+        case .audio: return audio.entry?.id.uuidString
+        case .video: return video.currentSourceVideoURL?.absoluteString
+        }
+    }
+
+    private var currentListeningMarks: [ListeningMark] {
+        reader.listeningMarks.marks(for: mode, materialID: listeningMaterialID)
+    }
+
+    private var markedAudioCues: Set<UUID> {
+        Set(currentListeningMarks.compactMap { mark in
+            guard case let .audio(_, cue, _) = mark.source.location else { return nil }
+            return cue
+        })
+    }
+
+    private func liveAudioCue(for mark: ListeningMark) -> AudioStudyCue? {
+        guard case let .audio(entry, cue, _) = mark.source.location, audio.entry?.id == entry else { return nil }
+        return audio.cues.first { $0.id == cue }
+    }
+
+    private func captureListeningMark() -> (() -> Void)? {
+        let sourceMode = mode
+        let material = listeningMaterialID
+        let version = reader.articleVersion
+        let source: ListeningTarget
+        switch mode {
+        case .text:
+            guard let sentence = speech.lastSpoken, let reference = reader.questionReference(for: sentence) else { return nil }
+            source = ListeningTarget(reference: reference)
+        case .audio:
+            guard let marked = audio.listeningMarkReference() else { return nil }
+            source = ListeningTarget(reference: marked.reference, milliseconds: marked.time)
+        case .video:
+            guard let marked = video.listeningMarkReference() else { return nil }
+            source = ListeningTarget(reference: marked.reference, milliseconds: marked.time)
+        }
+        return {
+            guard self.mode == sourceMode, listeningMaterialID == material,
+                  sourceMode != .text || reader.articleVersion == version,
+                  reader.listeningMarks.add(source.reference, milliseconds: source.milliseconds) else { return }
+            if preferences.listeningMarkSound { Self.markConfirmationSound?.play() }
+        }
+    }
+
+    private var trackedReplay: () -> Void {
+        let sourceMode = mode
+        let material = listeningMaterialID
+        let version = reader.articleVersion
+        let record = recordReplay
+        return {
+            guard self.mode == sourceMode, listeningMaterialID == material,
+                  sourceMode != .text || reader.articleVersion == version else { return }
+            switch sourceMode {
+            case .text:
+                let reference = speech.current.flatMap(reader.questionReference(for:))
+                speech.replay { speed in
+                    if let reference { record(.init(reference: reference), speed) }
+                }
+            case .audio:
+                audio.replay(onStarted: record)
+            case .video:
+                video.replaySentence(onStarted: record)
+            }
+        }
+    }
+
+    private var recordReplay: (ListeningTarget, PlaybackSpeed) -> Void {
+        let marks = reader.listeningMarks
+        return { marks.recordReplay($0, speed: $1) }
+    }
+
+    private func isListeningFavorite(_ mark: ListeningMark) -> Bool {
+        mark.source.mode == .text ? reader.originalFavoriteID(for: mark) != nil : mark.isSaved == true
+    }
+
+    private func toggleListeningFavorite(_ mark: ListeningMark) async throws {
+        if mark.source.mode == .text {
+            try await reader.toggleOriginalFavorite(for: mark)
+        } else {
+            try reader.listeningMarks.toggleMediaFavorite(mark.id)
+        }
+    }
+
+    private func reviewListeningMark(_ mark: ListeningMark, _ replay: Bool) async throws {
+        guard mode == mark.source.mode, listeningMaterialID == mark.materialID else { return }
+        switch mark.source.location {
+        case .text(_, let range, _):
+            let version = reader.articleVersion
+            try await reader.locateQuestionSource(mark.reference, excerpt: nil)
+            speech.stop()
+            guard replay, let sentence = reader.listeningSentence(at: range) else { return }
+            if reader.articleVersion != version {
+                pendingMarkedSpeech = (reader.articleVersion, sentence)
+            } else {
+                playMarkedSentence(sentence)
+            }
+        case .audio:
+            guard let cue = liveAudioCue(for: mark), let entry = audio.entry else {
+                throw ReaderError.message("这条音频字幕已不存在。")
+            }
+            showsSubtitles = true
+            if replay {
+                audio.playCue(cue.id, onReplayStarted: recordReplay)
+            } else {
+                audio.locateCue(cue.id)
+                if let selection = AudioSubtitleSelection(entry: entry, cueID: cue.id) {
+                    audio.selectQuestionReference(selection)
+                }
+            }
+        case .video:
+            try await video.locateQuestionSource(mark.reference, excerpt: nil, reviewMark: replay,
+                                                 onReplayStarted: recordReplay)
+        }
+    }
+
+    private func playMarkedSentence(_ sentence: TextExcerpt) {
+        let reference = reader.questionReference(for: sentence)
+        let record = recordReplay
+        let onStarted: (PlaybackSpeed) -> Void = { speed in
+            if let reference { record(.init(reference: reference), speed) }
+        }
+        let passage = reader.articleForListening(fromHere: false).sentences
+        if let start = passage.firstIndex(where: { $0.range == sentence.range }) {
+            speech.start(passage, at: start, stopsAfterSentence: true, onStarted: onStarted)
+        } else {
+            speech.start([sentence], stopsAfterSentence: true, onStarted: onStarted)
+        }
     }
 
     private func locateQuestionSource(_ reference: AssistantQuestionReference, _ excerpt: NSRange?) async throws {
@@ -919,134 +1139,76 @@ struct ReaderWindow: View {
         chat.replaceReference(with: reference)
     }
 
-    private var inspectorHeading: some View {
-        ReaderInspectorHeading(title: "学习助手", symbol: "text.bubble")
-    }
-
-    private var textAssistantAction: AssistantAction? {
-        if reader.study?.kind == .phrase { return .phrase }
-        if reader.study != nil || reader.shownFavorite != nil { return nil }
-        switch reader.lookup?.kind {
-        case .word: return .word
-        case .analysis: return .sentence
-        default: return nil
-        }
-    }
-
-    private var textAssistantAvailable: Set<AssistantAction> {
-        var available: Set<AssistantAction> = []
-        if reader.assistantWordTarget != nil { available.formUnion([.word, .phrase]) }
-        if reader.assistantSentenceTarget != nil || speech.current != nil { available.insert(.sentence) }
-        return available
-    }
-
-    private func performTextAssistantAction(_ action: AssistantAction) {
-        speech.pause()
-        switch action {
-        case .word:
-            if let word = reader.assistantWordTarget, reader.study != nil || reader.shownFavorite != nil
-                || reader.lookup?.excerpt != word || reader.lookup?.kind != .word {
-                reader.lookUp(.word, excerpt: word)
-            }
-        case .phrase:
-            if let word = reader.assistantWordTarget {
+    @ViewBuilder
+    private var textAssistantTools: some View {
+        Button("翻译选区") { speech.pause(); reader.lookUp(.translation) }
+            .disabled(!reader.hasEnglishSelection)
+        if let word = reader.assistantWordTarget {
+            Button("查词") { speech.pause(); reader.lookUp(.word, excerpt: word) }
+            Button(StudyKind.phrase.label) {
+                speech.pause()
                 reader.openStudy(.phrase, at: word, focusWord: word)
             }
-        case .sentence:
-            if let sentence = reader.assistantSentenceTarget ?? speech.current {
-                reader.lookUp(.analysis, excerpt: sentence)
-            }
         }
-    }
-
-    private var studyMenu: some View {
-        Button { showsStudyTools.toggle() } label: {
-            HStack(spacing: 9) {
-                Label("助读工具", systemImage: "sparkle.magnifyingglass")
-                Image(systemName: "chevron.down").font(.system(size: 16 * interfaceScale, weight: .semibold))
-            }
+        if let sentence = reader.assistantSentenceTarget ?? speech.current,
+           reader.assistantTranslation == nil || reader.study != nil {
+            Button("看整句翻译") { speech.pause(); reader.translateSentence(containing: sentence) }
+            Button("语法解析") { speech.pause(); reader.lookUp(.analysis, excerpt: sentence) }
         }
-        .buttonStyle(ReaderButtonStyle(prominent: showsStudyTools, compact: true, scale: 2))
-        .fixedSize()
-        .accessibilityLabel("助读工具")
-        .accessibilityIdentifier("studyMenu")
-        .popover(isPresented: $showsStudyTools, arrowEdge: .bottom) {
-            VStack(alignment: .leading, spacing: 7) {
-                ForEach(StudyKind.allCases, id: \.rawValue) { kind in
-                    Button {
-                        showsStudyTools = false
-                        reader.openStudy(kind)
-                    } label: {
-                        Label(kind.label, systemImage: kind.symbol)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(ReaderButtonStyle(prominent: false, compact: true, scale: 1.3))
-                    .disabled(kind == .phrase && reader.focusedWord == nil)
+        if let source = reader.assistantTranslation?.excerpt ?? reader.assistantSource {
+            Button("回到原文") { reader.locate(source.range) }
+                .accessibilityIdentifier("assistantReturnToSource")
+        }
+        if let translation = reader.assistantTranslation,
+           let text = reader.translationText(for: translation) {
+            if reader.lookup?.kind == .word {
+                Button("复制译文") { copyAssistantResult(text) }
+            }
+            if reader.canShowTranslationBelow(translation) {
+                Button(reader.isShowingTranslationBelow(translation) ? "收起正文译文" : "在原文下显示") {
+                    reader.toggleInlineTranslation(for: translation)
                 }
-                Divider()
-                Toggle("跟随阅读标记难点", isOn: Binding(get: { reader.assistedReading },
-                                                           set: { reader.setAssistedReading($0) }))
-                    .controlSize(.large)
+                .accessibilityIdentifier("showInlineTranslation")
             }
-            .padding(14)
-            .frame(width: 248)
         }
-    }
-
-    private func action(_ kind: LookupKind, shortcut: String) -> some View {
-        Button {
-            speech.pause()
-            reader.lookUp(kind)
-        } label: {
-            Label(kind.label, systemImage: kind.symbol)
-                .frame(maxWidth: .infinity)
+        if !reader.answer.isEmpty, reader.lookup != nil, reader.study == nil {
+            Button("复制结果") { copyAssistantResult(reader.answer) }
         }
-        .buttonStyle(ReaderButtonStyle(prominent: kind == .translation, compact: true))
-        .disabled(!reader.hasEnglishSelection)
-        .help("\(kind.label)（\(shortcut)）")
+        Menu("助读工具") {
+            ForEach(StudyKind.allCases.filter { $0 != .phrase }, id: \.rawValue) { kind in
+                Button(kind == .hints ? reader.hintStatus ?? kind.label : kind.label) {
+                    speech.pause()
+                    reader.openStudy(kind)
+                }
+            }
+            Toggle("跟随阅读标记难点", isOn: Binding(get: { reader.assistedReading }, set: reader.setAssistedReading))
+        }
     }
 
     private func translationAnalysisSection(for lookup: LookupRequest) -> some View {
         let analysis = reader.translationAnalysis
         let isExpanded = analysis?.isExpanded == true
-        return VStack(spacing: 8) {
-            Button {
-                reader.toggleTranslationAnalysis(for: lookup)
-            } label: {
-                HStack(spacing: 8) {
-                    Label(isExpanded ? "收起语法解析" : LookupKind.analysis.label,
-                          systemImage: LookupKind.analysis.symbol)
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .imageScale(.small)
-                        .accessibilityHidden(true)
-                }
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(ReaderButtonStyle(prominent: false, compact: true, scale: 2))
-            .accessibilityIdentifier("analyzeTranslation")
-
+        return VStack(alignment: .leading, spacing: 0) {
+            Divider()
+            AssistantGrammarRow(isExpanded: isExpanded) { reader.toggleTranslationAnalysis(for: lookup) }
             if let analysis, isExpanded {
                 VStack(alignment: .leading, spacing: 12) {
                     translationSummary(analysis, for: lookup)
-                    Button { reader.toggleTranslationDetails(lookup) } label: {
-                        Label(analysis.detailsExpanded ? "收起完整讲解" : "展开完整讲解",
-                              systemImage: analysis.detailsExpanded ? "chevron.up" : "chevron.down")
-                            .frame(maxWidth: .infinity)
+                    Button(analysis.detailsExpanded ? "收起完整讲解" : "展开完整讲解") {
+                        reader.toggleTranslationDetails(lookup)
                     }
-                    .buttonStyle(ReaderButtonStyle(prominent: false, scale: 1.12))
+                    .buttonStyle(.link)
                     .accessibilityIdentifier("translationAnalysisDetails")
                     if analysis.detailsExpanded { translationDetails(analysis, for: lookup) }
                     if let draft = reader.grammarFavorite {
-                        LearningFavoriteButton(reader: reader, draft: draft)
+                        LearningFavoriteButton(reader: reader, draft: draft, controlScale: 1)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(15)
-                .background(ReaderPalette.card, in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ReaderPalette.rule, lineWidth: 1))
+                .padding(.bottom, 12)
             }
+            Divider()
         }
-        .padding([.horizontal, .bottom], 16)
     }
 
     @ViewBuilder
@@ -1095,8 +1257,9 @@ struct ReaderWindow: View {
             Label("已收藏 · \(favorite.kind.label)", systemImage: "star.fill")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(ReaderPalette.accent)
-            Text(favorite.selectedText)
+            Text(favorite.displayQuote)
                 .font(.system(size: 19, design: .serif))
+                .accessibilityIdentifier("savedFavoriteQuotation")
                 .textSelection(.enabled)
             Rectangle().fill(ReaderPalette.rule).frame(height: 1)
             let text = [favorite.result.definition, favorite.result.translation, favorite.result.analysis]
@@ -1118,114 +1281,6 @@ struct ReaderWindow: View {
         }
         .font(.system(size: 13))
         .foregroundStyle(ReaderPalette.muted)
-    }
-
-    private func lookupCard(_ lookup: LookupRequest) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Label(lookup.kind.label, systemImage: lookup.kind.symbol)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(ReaderPalette.accent)
-                Spacer()
-                if reader.isLookingUp {
-                    Button("停止") { reader.cancelLookup() }
-                        .buttonStyle(.link)
-                        .font(.system(size: 12))
-                } else if !reader.answer.isEmpty {
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(reader.answer, forType: .string)
-                        copied = true
-                    } label: {
-                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(copied ? "已复制" : "复制结果")
-                    .help(copied ? "已复制" : "复制结果")
-                }
-            }
-            Text(lookup.excerpt.text)
-                .font(.system(size: lookup.kind == .word ? min(36, max(25, fontSize + 3)) : min(19, max(15, fontSize * 0.65)), design: .serif))
-                .lineLimit(lookup.kind == .word ? 3 : 4)
-                .textSelection(.enabled)
-                .accessibilityAddTraits(.isHeader)
-            if lookup.kind == .word {
-                ViewThatFits(in: .horizontal) {
-                    HStack { wordActions(lookup.excerpt) }
-                    VStack(alignment: .leading, spacing: 6) { wordActions(lookup.excerpt) }
-                }
-            }
-            if lookup.kind == .analysis {
-                Button { reader.openStudy(.structure, at: lookup.excerpt) } label: {
-                    Label("先看主干", systemImage: StudyKind.structure.symbol)
-                }
-                .controlSize(.large)
-                .accessibilityIdentifier("showSentenceStructure")
-            }
-            if !reader.isLookingUp, reader.lookupError == nil, !reader.answer.isEmpty,
-               reader.canShowTranslationBelow(lookup) {
-                Button { reader.toggleInlineTranslation(for: lookup) } label: {
-                    Label(reader.isShowingTranslationBelow(lookup) ? "收起正文译文" : "在原文下显示",
-                          systemImage: "text.append")
-                }
-                .buttonStyle(ReaderButtonStyle(prominent: false, compact: true, scale: 2))
-                .accessibilityIdentifier("showInlineTranslation")
-            }
-            if let draft = reader.lookupFavorite {
-                LearningFavoriteButton(reader: reader, draft: draft)
-            }
-            Rectangle().fill(ReaderPalette.rule).frame(height: 1)
-
-            if !reader.answer.isEmpty {
-                AnswerText(answer: reader.answer, fontSize: max(17, min(32, fontSize * 0.8)))
-                    .accessibilityIdentifier("lookupAnswer")
-            }
-
-            if let error = reader.lookupError {
-                Label(error, systemImage: "exclamationmark.circle")
-                    .font(.system(size: 13))
-                    .foregroundStyle(ReaderPalette.warning)
-                Button("重试") { reader.lookUp(lookup.kind, excerpt: lookup.excerpt) }
-                    .buttonStyle(.link)
-            } else if reader.isLookingUp {
-                lookupProgress(reader.answer)
-            } else if reader.answer.isEmpty {
-                Button("重新查询") { reader.lookUp(lookup.kind, excerpt: lookup.excerpt) }
-                    .buttonStyle(.link)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(15)
-        .background(ReaderPalette.card, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(ReaderPalette.rule, lineWidth: 1))
-        .padding(16)
-    }
-
-    @ViewBuilder
-    private func wordActions(_ excerpt: TextExcerpt) -> some View {
-        Button { reader.translateSentence(containing: excerpt) } label: {
-            Label("看整句", systemImage: "text.cursor")
-        }
-        .controlSize(.large)
-        .fixedSize()
-        .accessibilityIdentifier("selectWholeSentence")
-        .help("选中整句并在右侧显示译文")
-        if reader.focusedWord != nil {
-            Button { reader.openStudy(.phrase, at: excerpt) } label: {
-                Label("看完整搭配", systemImage: StudyKind.phrase.symbol)
-            }
-            .controlSize(.large)
-            .fixedSize()
-            .accessibilityIdentifier("showWordPhrase")
-        }
-        if reader.referenceWord != nil {
-            Button { reader.openStudy(.reference, at: excerpt) } label: {
-                Label("指代与省略", systemImage: StudyKind.reference.symbol)
-            }
-            .controlSize(.large)
-            .fixedSize()
-            .accessibilityIdentifier("showWordReference")
-        }
     }
 
     private var connectionLabel: String {

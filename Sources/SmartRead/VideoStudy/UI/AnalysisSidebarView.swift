@@ -3,88 +3,174 @@ import SwiftUI
 struct VideoStudyInspector: View {
     @ObservedObject var model: VideoStudyModel
     let reader: ReaderModel
+    @Binding var clickWholeSentence: Bool
+    var listeningMarks: [ListeningMark] = []
     let locateQuestionSource: (AssistantQuestionReference, NSRange?) async throws -> Void
+    @State private var translation = AssistantLanguageLookup()
+    @State private var showsWordDetails = false
+    @State private var showsCalibration = false
+    @State private var modeBeforeTranscript: SidebarMode = .analysis
     @Environment(\.readerInterfaceScale) private var scale
 
     var body: some View {
-        ReaderInspector(scrollsContent: model.sidebarMode != .transcript) {
-            VStack(alignment: .leading, spacing: 12 * scale) {
-                ReaderInspectorHeading(title: "学习助手", symbol: "text.bubble")
-                AssistantActions(selected: selectedAction, available: availableActions, perform: perform)
-                VideoStudyTools(model: model)
-            }
+        AssistantInspector(reader: reader, mode: .video, materialID: model.currentSourceVideoURL?.absoluteString,
+                           locate: locateQuestionSource, manualSelection: model.questionSelection,
+                           visiblePassage: visiblePassage, scrollsContent: model.sidebarMode != .transcript,
+                           sentenceFavorite: sentenceFavorite, reference: model.questionReference) {
+            tools
         } content: {
             switch model.sidebarMode {
-            case .analysis:
-                AnalysisDetailView(model: model)
-            case .word:
-                WordExplanationView(model: model)
+            case .analysis, .word:
+                if let selection = model.selectedSubtitle, let source = model.sidebarSource, model.showEnglishSubtitle {
+                    results(selection, time: source.time)
+                } else {
+                    Text(model.showEnglishSubtitle ? "点击英文字幕查看词义和整句翻译。" : "字幕已隐藏。")
+                        .font(.system(size: 13))
+                        .foregroundStyle(ReaderPalette.muted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(18)
+                }
             case .phrase:
                 if let request = model.assistantPhraseRequest {
-                    VideoPhraseView(model: model, reader: reader, request: request).id(request)
+                    VideoPhraseView(reader: reader, request: request).id(request)
                 }
             case .transcript:
-                SubtitleTranscriptView(model: model)
+                SubtitleTranscriptView(model: model, listeningMarks: listeningMarks)
             }
-        } footer: {
-            if (model.sidebarMode == .word || model.sidebarMode == .analysis), !model.obsidianVaultPath.isEmpty {
+        }
+        .onChange(of: model.selectedSubtitle, initial: true) { updateTranslation() }
+        .onChange(of: model.showEnglishSubtitle) { updateTranslation() }
+        .onChange(of: model.selectedWordRequest) { showsWordDetails = false }
+        .onDisappear { translation.clear() }
+        .sheet(isPresented: $showsCalibration) {
+            VideoSubtitleCalibration(model: model, isPresented: $showsCalibration)
+        }
+    }
+
+    private var visiblePassage: String? {
+        guard model.showEnglishSubtitle, model.sidebarMode == .analysis || model.sidebarMode == .word,
+              model.sidebarSource != nil else { return nil }
+        return model.selectedSubtitle?.english
+    }
+
+    private var sentenceFavorite: AssistantSentenceFavoriteAction? {
+        guard visiblePassage != nil, let reference = model.questionReference(currentOnly: false),
+              let source = model.sidebarSource else { return nil }
+        return .init(marks: reader.listeningMarks, target: .init(reference: reference, milliseconds: source.time))
+    }
+
+    private func updateTranslation() {
+        guard model.showEnglishSubtitle, let selection = model.selectedSubtitle, selection.chinese.isEmpty else {
+            translation.clear()
+            return
+        }
+        let excerpt = TextExcerpt(text: selection.english,
+                                  range: NSRange(location: 0, length: selection.english.utf16.count), context: selection.english)
+        translation.load(.init(kind: .translation, excerpt: excerpt,
+                               surrounding: SentenceContext(previousSentence: selection.previousEnglish,
+                                                            nextSentence: selection.nextEnglish)), using: reader)
+    }
+
+    @ViewBuilder
+    private var tools: some View {
+        Toggle("点整句", isOn: $clickWholeSentence)
+        Button("翻译当前句", action: model.translateCurrentSubtitle)
+            .disabled(!model.showEnglishSubtitle || !model.canAnalyzeCurrentSubtitle)
+        if model.showEnglishSubtitle, model.sidebarSource != nil, model.sidebarMode != .transcript {
+            Button("回到原文", action: model.jumpToSidebarSource)
+                .accessibilityIdentifier("assistantReturnToSource")
+        }
+        if model.showEnglishSubtitle, model.sidebarMode == .word || model.sidebarMode == .phrase {
+            if model.sidebarMode == .phrase {
+                Button("返回词义和译文") { model.sidebarMode = .word }
+            } else {
+                Button(showsWordDetails ? "收起用法和例句" : "用法和例句") { showsWordDetails.toggle() }
+                if model.assistantPhraseRequest != nil {
+                    Button(StudyKind.phrase.label) { model.pauseForLearning(); model.sidebarMode = .phrase }
+                }
+            }
+        }
+        if model.showEnglishSubtitle, let selection = model.selectedSubtitle, model.sidebarMode != .transcript {
+            if let text = selection.chinese.isEmpty ? translation.result.completedText : selection.chinese {
+                Button("复制译文") { copyAssistantResult(text) }
+            }
+        }
+        if model.isListeningFirst {
+            Button(model.revealButtonTitle, action: model.revealSubtitle)
+                .disabled(!model.canAdvanceListeningStage)
+        }
+        Button(model.sidebarMode == .transcript ? "返回学习助手" : "查看文稿") {
+            if model.sidebarMode == .transcript {
+                model.sidebarMode = modeBeforeTranscript
+            } else {
+                modeBeforeTranscript = model.sidebarMode
+                model.sidebarMode = .transcript
+            }
+        }
+        .disabled(model.currentSourceVideoURL == nil)
+        .accessibilityIdentifier("videoTranscript")
+        VideoStudyTools(model: model, showsCalibration: $showsCalibration)
+    }
+
+    private func noteButton(forWord: Bool) -> some View {
+        let type = forWord ? "词义" : "语法解析"
+        let state = forWord ? model.wordNoteState : model.sentenceNoteState
+        let title = switch state {
+        case .idle: "添加\(type)到 Obsidian"
+        case .writing: "正在写入\(type)…"
+        case .saved: "\(type)已添加到 Obsidian"
+        case .pending: "重试写入\(type)"
+        }
+        return Button(title) { model.confirmNote(forWord: forWord) }
+            .buttonStyle(ReaderButtonStyle(prominent: false, compact: true))
+            .disabled(!model.canConfirmNote(forWord: forWord))
+            .accessibilityIdentifier(forWord ? "confirmObsidianWord" : "confirmObsidianNote")
+    }
+
+    private func results(_ selection: SubtitleSelection, time: Int64) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if model.sidebarMode == .word, let word = model.selectedWordRequest?.word {
+                AssistantSectionTitle(title: "词义")
+                Text(word.text).font(.system(size: 25, weight: .semibold, design: .serif)).textSelection(.enabled)
+                WordExplanationView(model: model, showsDetails: showsWordDetails)
+                if !model.obsidianVaultPath.isEmpty, case .loaded = model.wordLookupState {
+                    noteButton(forWord: true)
+                }
                 Divider()
-                ObsidianConfirmationFooter(model: model)
             }
-            AssistantQuestionPanel(reader: reader, mode: .video, materialID: model.currentSourceVideoURL?.absoluteString,
-                                   locate: locateQuestionSource, manualSelection: model.questionSelection,
-                                   reference: model.questionReference)
+            AssistantPassage(sentence: selection.english,
+                             focus: model.sidebarMode == .word ? model.assistantPhraseRequest?.focusedWord?.range : nil,
+                             timestamp: SubtitleTimeLabel.string(time))
+            if selection.chinese.isEmpty {
+                AssistantResult(result: translation.result, fontSize: max(15, 17 * scale),
+                                cancel: translation.cancel, retry: updateTranslation)
+            } else {
+                Text(selection.chinese).font(.system(size: max(15, 17 * scale))).textSelection(.enabled)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                Divider()
+                AssistantGrammarRow(isExpanded: model.assistantGrammarExpanded, toggle: model.toggleAssistantGrammar)
+                if model.assistantGrammarExpanded {
+                    AnalysisDetailView(model: model).padding(.bottom, 12)
+                    if !model.obsidianVaultPath.isEmpty, case .loaded = model.analysisState {
+                        noteButton(forWord: false).padding(.bottom, 12)
+                    }
+                }
+                Divider()
+            }
+            if model.sidebarMode == .word, case .pending(let message) = model.wordNoteState {
+                Text(message).font(.caption).foregroundStyle(ReaderPalette.warning)
+            }
+            if case .pending(let message) = model.sentenceNoteState {
+                Text(message).font(.caption).foregroundStyle(ReaderPalette.warning)
+            }
         }
-    }
-
-    private var selectedAction: AssistantAction? {
-        switch model.sidebarMode {
-        case .analysis: model.selectedSubtitle == nil ? nil : .sentence
-        case .word: .word
-        case .phrase: .phrase
-        case .transcript: nil
-        }
-    }
-
-    private var availableActions: Set<AssistantAction> {
-        var actions: Set<AssistantAction> = []
-        if model.hasAssistantWord { actions.insert(.word) }
-        if model.assistantPhraseRequest != nil { actions.insert(.phrase) }
-        if model.canAnalyzeAssistantSentence { actions.insert(.sentence) }
-        return actions
-    }
-
-    private func perform(_ action: AssistantAction) {
-        switch action {
-        case .word:
-            model.pauseForLearning()
-            model.sidebarMode = .word
-        case .phrase:
-            model.pauseForLearning()
-            model.sidebarMode = .phrase
-        case .sentence:
-            model.analyzeAssistantSentence()
-        }
-    }
-}
-
-private struct VideoAssistantSource: View {
-    @ObservedObject var model: VideoStudyModel
-    let sentence: String
-
-    var body: some View {
-        if let source = model.sidebarSource {
-            AssistantSourceRow(sentence: source.sentence, timestamp: SubtitleTimeLabel.string(source.time),
-                               goBack: model.jumpToSidebarSource)
-        } else {
-            Text(sentence)
-                .textSelection(.enabled)
-        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
     }
 }
 
 private struct VideoPhraseView: View {
-    @ObservedObject var model: VideoStudyModel
     let reader: ReaderModel
     let request: StudyRequest
     @State private var result: AssistantLookupResult = .loading("")
@@ -93,7 +179,8 @@ private struct VideoPhraseView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            VideoAssistantSource(model: model, sentence: request.target.text)
+            AssistantSectionTitle(title: "搭配")
+            Text(request.target.text).font(.system(size: 17, design: .serif)).textSelection(.enabled)
             Divider()
             AssistantResult(result: result, fontSize: 19 * scale) { retry += 1 }
         }
@@ -113,109 +200,37 @@ private struct VideoPhraseView: View {
     }
 }
 
-private struct ObsidianConfirmationFooter: View {
-    @ObservedObject var model: VideoStudyModel
-
-    private var title: String {
-        switch model.currentNoteState {
-        case .idle: "添加到 Obsidian"
-        case .writing: "正在写入…"
-        case .saved: "已添加到 Obsidian"
-        case .pending: "重试写入"
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button(action: model.confirmCurrentNote) {
-                Label(title, systemImage: model.currentNoteState.isSaved ? "checkmark.circle" : "square.and.arrow.down")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(ReaderButtonStyle(prominent: true, compact: true, scale: 1.3))
-            .disabled(!model.canConfirmCurrentNote)
-            .accessibilityIdentifier("confirmObsidianNote")
-            Group {
-                if model.obsidianVaultPath.isEmpty {
-                    Text("请先在设置中选择 Obsidian 文件夹。")
-                } else {
-                    switch model.currentNoteState {
-                    case .idle: Text("确认后才写入；未确认的查询不会收录。")
-                    case .writing: Text("正在更新当天的同一篇笔记。")
-                    case let .saved(note): Text("已写入 \(note)。")
-                    case let .pending(message): Text(message)
-                    }
-                }
-            }
-            .font(.system(size: 13))
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private extension NoteConfirmationState {
-    var isSaved: Bool { if case .saved = self { true } else { false } }
-}
-
 private struct WordExplanationView: View {
     @ObservedObject var model: VideoStudyModel
+    let showsDetails: Bool
     @Environment(\.readerInterfaceScale) private var scale
-    private var fontSize: CGFloat { 19 * scale }
+    private var fontSize: CGFloat { max(15, 17 * scale) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            if let request = model.selectedWordRequest {
-                Text(request.word.text)
-                    .font(.system(size: fontSize + 8, weight: .semibold))
-                    .textSelection(.enabled)
-                VideoAssistantSource(model: model, sentence: request.sentence)
-                Divider()
-                switch model.wordLookupState {
-                case .idle:
-                    EmptyView()
-                case .loading:
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("正在查询词语…")
-                            .font(.system(size: fontSize))
-                            .foregroundStyle(.secondary)
-                        Button("取消") { model.cancelWordLookup() }
-                    }
-                case let .loaded(explanation):
-                    AnalysisSection(title: "原形 · 词性", content: "\(explanation.lemma) · \(explanation.partOfSpeechZh)", fontSize: fontSize)
-                    AnalysisSection(title: "本句中的意思", content: explanation.meaningZh, fontSize: fontSize)
-                    AnalysisSection(title: "用法", content: explanation.usageNoteZh, fontSize: fontSize)
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("例句")
-                            .font(.system(size: max(13, fontSize - 3), weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        Text(explanation.exampleEnglish)
-                            .font(.system(size: fontSize + 1, weight: .semibold))
-                            .textSelection(.enabled)
-                        Text(explanation.exampleChinese)
-                            .font(.system(size: fontSize))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
-                case let .failed(message):
-                    Label(message, systemImage: "exclamationmark.triangle")
-                        .font(.system(size: fontSize))
-                        .foregroundStyle(ReaderPalette.warning)
-                    Button("重试查词") { model.retryWordLookup() }
-                }
-            } else {
-                ContentUnavailableView(
-                    "点词或拖选短语", systemImage: "character.book.closed",
-                    description: Text("点击单词，或从第一个词拖到最后一个词（最多八个词）。视频会暂停，解释只针对选中的词语。")
-                )
-                .frame(maxWidth: .infinity)
-                .padding(.top, 14)
+        switch model.wordLookupState {
+        case .idle: EmptyView()
+        case .loading:
+            HStack {
+                ProgressView().controlSize(.small)
+                Text("正在查询词语…").foregroundStyle(ReaderPalette.muted)
+                Button("停止", action: model.cancelWordLookup).buttonStyle(.link)
             }
+            .font(.caption)
+        case .loaded(let explanation):
+            VStack(alignment: .leading, spacing: 8) {
+                Text("\(explanation.partOfSpeechZh) · \(explanation.meaningZh)")
+                    .font(.system(size: fontSize)).textSelection(.enabled)
+                if showsDetails {
+                    AnalysisSection(title: "原形与用法", content: "\(explanation.lemma) · \(explanation.usageNoteZh)",
+                                    fontSize: fontSize)
+                    AnalysisSection(title: "例句", content: "\(explanation.exampleEnglish)\n\(explanation.exampleChinese)",
+                                    fontSize: fontSize)
+                }
+            }
+        case .failed(let message):
+            Text(message).font(.caption).foregroundStyle(ReaderPalette.warning)
+            Button("重试查词", action: model.retryWordLookup).buttonStyle(.link)
         }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -223,34 +238,6 @@ private struct AnalysisDetailView: View {
     @ObservedObject var model: VideoStudyModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            if let selection = model.selectedSubtitle {
-                VideoAssistantSource(model: model, sentence: selection.english)
-                if !selection.chinese.isEmpty {
-                    Text(selection.chinese)
-                        .font(.system(size: analysisFontSize))
-                        .foregroundStyle(ReaderPalette.muted)
-                        .textSelection(.enabled)
-                }
-
-                Divider()
-
-                analysisContent
-            } else {
-                ContentUnavailableView(
-                    "点击「整句解析」",
-                    systemImage: "text.bubble",
-                    description: Text("视频会暂停，当前句子的本地 AI 解释会显示在这里。")
-                )
-                .frame(maxWidth: .infinity)
-                .padding(.top, 14)
-            }
-        }
-        .padding(18)
-    }
-
-    @ViewBuilder
-    private var analysisContent: some View {
         switch model.analysisState {
         case .idle:
             EmptyView()
@@ -269,12 +256,6 @@ private struct AnalysisDetailView: View {
                    SubtitleWordTokenizer.words(in: source).map(\.text) != SubtitleWordTokenizer.words(in: model.selectedSubtitle?.english ?? "").map(\.text) {
                     AnalysisSection(title: model.selectedSubtitle?.sourceContext?.cues.count == 1 ? "实际解析台词" : "结合相邻字幕理解\(model.selectedSubtitle?.sourceContext.map { "（\($0.cues.count) 条）" } ?? "")", content: source, fontSize: analysisFontSize)
                 }
-                AnalysisSection(
-                    title: "意思",
-                    content: analysis.translationZh,
-                    fontSize: analysisFontSize
-                )
-
                 VStack(alignment: .leading, spacing: 6) {
                     Text("表达")
                         .font(

@@ -1,19 +1,19 @@
 import Foundation
 import Observation
 
-struct AssistantQuestionSource: Codable, Equatable {
-    struct Cue: Codable, Equatable {
+struct AssistantQuestionSource: Codable, Equatable, Sendable {
+    struct Cue: Codable, Equatable, Sendable {
         let start: Int64
         let text: String
     }
 
-    enum Location: Codable, Equatable {
+    enum Location: Codable, Equatable, Sendable {
         case text(material: String, range: NSRange, pdf: PDFBookLocation?)
         case audio(entry: UUID, cue: UUID, range: NSRange)
         case video(file: URL, cues: [Cue])
     }
 
-    enum VideoTrack: Codable, Equatable {
+    enum VideoTrack: Codable, Equatable, Sendable {
         case external(URL)
         case embedded(Int)
     }
@@ -68,13 +68,17 @@ extension AssistantQuestionReference {
     }
 }
 
-struct AssistantQuestionFavorite: Codable, Equatable, Identifiable {
+struct AssistantQuestionFavorite: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
     let question: String
     let answer: String
     let reference: AssistantQuestionReference?
     let mode: ReaderMode
     let savedAt: Date
+    var weeklyOrigin: WeeklyFavoriteOrigin? = nil
+
+    var weeklyID: String { Self.weeklyID(for: id) }
+    static func weeklyID(for id: UUID) -> String { "question:" + id.uuidString.lowercased() }
 }
 
 @MainActor
@@ -87,7 +91,7 @@ final class AssistantQuestionFavorites {
     init(file: URL) {
         self.file = file
         do {
-            entries = try JSONDecoder().decode([AssistantQuestionFavorite].self, from: Data(contentsOf: file))
+            entries = try Self.read(file)
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
             return
         } catch {
@@ -95,13 +99,22 @@ final class AssistantQuestionFavorites {
         }
     }
 
+    nonisolated static func read(_ file: URL) throws -> [AssistantQuestionFavorite] {
+        try JSONDecoder().decode([AssistantQuestionFavorite].self, from: Data(contentsOf: file))
+    }
+
     func contains(_ id: UUID) -> Bool { entries.contains { $0.id == id } }
 
-    func toggle(_ turn: AssistantQuestionTurn, mode: ReaderMode) throws {
+    func toggle(_ turn: AssistantQuestionTurn, mode: ReaderMode, weeklyOrigin: WeeklyFavoriteOrigin? = nil,
+                stage: (AssistantQuestionFavorite) -> Void = { _ in }) throws {
         guard turn.isComplete else { return }
         if contains(turn.id) { try remove(turn.id); return }
+        guard let reference = turn.reference, reference.hasOriginalPassage else {
+            throw ReaderError.message("请先引用原句，再重新提问后收藏。")
+        }
         let item = AssistantQuestionFavorite(id: turn.id, question: turn.question, answer: turn.answer,
-                                             reference: turn.reference, mode: mode, savedAt: .now)
+                                             reference: reference, mode: mode, savedAt: .now, weeklyOrigin: weeklyOrigin)
+        stage(item)
         try save([item] + entries)
     }
 

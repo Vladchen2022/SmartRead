@@ -11,6 +11,7 @@ struct ReaderTextView: NSViewRepresentable {
     let version: UUID
     let fontSize: Double
     let marks: [ReaderMark]
+    let listeningMarks: [TextListeningMark]
     let inlineTranslation: InlineTranslation?
     let jump: ReadingJump?
     let listeningFocus: ListeningFocus?
@@ -29,6 +30,7 @@ struct ReaderTextView: NSViewRepresentable {
     let onCloseInline: () -> Void
     let onTranslateSentence: (TextExcerpt) -> Void
     let onSpeakSelection: (TextExcerpt) -> Void
+    let onCancelMark: (UUID) -> Void
     let onWordStudy: (StudyKind, TextExcerpt) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
@@ -71,8 +73,10 @@ struct ReaderTextView: NSViewRepresentable {
             coordinator?.parent.onListeningFocusArrived(id)
         }
         view.onTextClick = { [weak coordinator = context.coordinator, weak surface] position in
-            if coordinator?.parent.onTextClick(position) == true {
-                surface?.showActions()
+            guard let surface else { return }
+            surface.clickedCharacter = position
+            if coordinator?.parent.onTextClick(position) == true || surface.selectedMark != nil {
+                surface.showActions()
             }
         }
         view.onUserSelection = { [weak coordinator = context.coordinator] selection in
@@ -93,6 +97,9 @@ struct ReaderTextView: NSViewRepresentable {
         surface.onSpeakSelection = { [weak coordinator = context.coordinator] excerpt in
             coordinator?.parent.onSpeakSelection(excerpt)
         }
+        surface.onCancelMark = { [weak coordinator = context.coordinator] id in
+            coordinator?.parent.onCancelMark(id)
+        }
         surface.onWordStudy = { [weak coordinator = context.coordinator] kind, excerpt in
             coordinator?.parent.onWordStudy(kind, excerpt)
         }
@@ -110,6 +117,7 @@ struct ReaderTextView: NSViewRepresentable {
         defer { surface.isUpdatingText = false }
         surface.articleVersion = version
         surface.setWordAction(wordAction)
+        surface.setListeningMarks(listeningMarks)
         surface.setInterfaceScale(interfaceScale)
 
         let newArticle = coordinator.version != version
@@ -150,6 +158,7 @@ struct ReaderTextView: NSViewRepresentable {
             }
             storage.setAttributedString(content)
             if newArticle {
+                surface.clickedCharacter = nil
                 surface.pendingResumeCharacter = nil
                 surface.setSelection(nil)
                 view.setSelectedRange(NSRange(location: 0, length: 0))
@@ -164,7 +173,7 @@ struct ReaderTextView: NSViewRepresentable {
             surface.needsLayout = true
         }
 
-        var visibleMarks = marks
+        var visibleMarks = marks + listeningMarks.map { ReaderMark(range: $0.range, style: .listening) }
         if highlightsSpeech, let range = listeningFocus?.request.range, range.location >= 0, range.length > 0,
            NSMaxRange(range) <= bodyText.utf16.count {
             visibleMarks.append(ReaderMark(range: range, style: .spoken))
@@ -250,6 +259,7 @@ private final class ReadingSurface: NSView {
     var onReadingPosition: ((Int, UUID, Bool) -> Void)?
     var onTranslateSentence: ((TextExcerpt) -> Void)?
     var onSpeakSelection: ((TextExcerpt) -> Void)?
+    var onCancelMark: ((UUID) -> Void)?
     var onWordStudy: ((StudyKind, TextExcerpt) -> Void)?
     var onListeningFocusArrived: ((UUID) -> Void)?
     var isUpdatingText = false
@@ -257,6 +267,11 @@ private final class ReadingSurface: NSView {
     var pendingResumeCharacter: Int?
 
     private var selection: TextExcerpt?
+    private var listeningMarks: [TextListeningMark] = []
+    var clickedCharacter: Int?
+    var selectedMark: TextListeningMark? {
+        TextListeningMark.matching(listeningMarks, selection: selection?.range, click: clickedCharacter)
+    }
     private var wordAction: SelectionActions.WordAction?
     private var areActionsDismissed = false
     private(set) var isTrackingSelection = false
@@ -268,6 +283,8 @@ private final class ReadingSurface: NSView {
     private var pendingUserScrollVersion: UUID?
     private var interfaceScale: CGFloat = 1
     private var actionsScale: CGFloat = 1
+    private var showsLanguageActions = false
+    private var shownMark: TextListeningMark?
     private lazy var actions = NSHostingView(rootView: actionView())
     private let shade = ListeningShadeView()
     private var listeningFocus: ListeningFocus?
@@ -332,22 +349,27 @@ private final class ReadingSurface: NSView {
         }
         updateShade()
         let viewport = convert(scroll.contentView.bounds, from: scroll.contentView)
-        guard !areActionsDismissed, !isTrackingSelection, let anchor = selection ?? wordAction?.excerpt,
-              allowsLanguageActions?(anchor) == true else {
+        let excerpt = selection ?? wordAction?.excerpt
+        let mark = selectedMark
+        let language = excerpt.map { anchor in
+            allowsLanguageActions?(anchor) == true && (text.inlineTranslation.map {
+                NSIntersectionRange(anchor.range, $0.sentence).length == 0
+            } ?? true)
+        } ?? false
+        guard !areActionsDismissed, !isTrackingSelection,
+              let anchor = language ? excerpt?.range : mark?.range else {
             actions.isHidden = true
             return
         }
-        if let translation = text.inlineTranslation,
-           NSIntersectionRange(anchor.range, translation.sentence).length > 0 {
-            actions.isHidden = true
-            return
-        }
-        let lines = text.visibleSelectionLines(for: text.displayedRange(for: anchor.range))
+        let lines = text.visibleSelectionLines(for: text.displayedRange(for: anchor))
             .map { convert($0, from: text).intersection(viewport) }
             .filter { !$0.isEmpty }
-        let baseSize = SelectionActionPlacement.size(forWord: selection == nil, scale: 1)
+        let forWord = selection == nil && wordAction != nil
+        let baseSize = SelectionActionPlacement.size(forWord: forWord, hasLanguageActions: language,
+                                                     hasMark: mark != nil, scale: 1)
         let scale = min(interfaceScale, max(0, (viewport.width - 16) / baseSize.width))
-        let size = SelectionActionPlacement.size(forWord: selection == nil, scale: scale)
+        let size = SelectionActionPlacement.size(forWord: forWord, hasLanguageActions: language,
+                                                 hasMark: mark != nil, scale: scale)
         guard scale > 0 else {
             actions.isHidden = true
             return
@@ -357,8 +379,10 @@ private final class ReadingSurface: NSView {
             actions.isHidden = true
             return
         }
-        if actionsScale != scale {
+        if actionsScale != scale || showsLanguageActions != language || shownMark != mark {
             actionsScale = scale
+            showsLanguageActions = language
+            shownMark = mark
             actions.rootView = actionView()
         }
         actions.frame = frame
@@ -476,6 +500,12 @@ private final class ReadingSurface: NSView {
         needsLayout = true
     }
 
+    func setListeningMarks(_ marks: [TextListeningMark]) {
+        guard listeningMarks != marks else { return }
+        listeningMarks = marks
+        needsLayout = true
+    }
+
     func showActions() {
         areActionsDismissed = false
         needsLayout = true
@@ -490,7 +520,14 @@ private final class ReadingSurface: NSView {
     }
 
     private func actionView() -> SelectionActions {
-        SelectionActions(wordAction: selection == nil ? wordAction : nil, scale: actionsScale,
+        let cancelMark: (() -> Void)? = shownMark.map { mark in
+            { [weak self] in
+                guard let self, self.selectedMark == mark else { return }
+                self.onCancelMark?(mark.id)
+            }
+        }
+        return SelectionActions(wordAction: selection == nil ? wordAction : nil,
+                                hasLanguageActions: showsLanguageActions, cancelMark: cancelMark, scale: actionsScale,
                          translation: { [weak self] in
                              guard let self, let selection = self.selection,
                                    self.text.originalSelectionRange == selection.range else { return }
@@ -562,6 +599,7 @@ private final class ReadingSurface: NSView {
     }
 
     private func beginSelection() {
+        clickedCharacter = nil
         isTrackingSelection = true
         dismissActions()
     }
@@ -718,8 +756,13 @@ private final class ClickableTextView: NSTextView {
         layoutManager.spokenSegments = []
         for mark in previous {
             for range in inlineTranslation?.displayedSegments(for: mark.range) ?? [mark.range] {
-                layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
-                layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
+                if mark.style == .listening {
+                    layoutManager.removeTemporaryAttribute(.underlineStyle, forCharacterRange: range)
+                    layoutManager.removeTemporaryAttribute(.underlineColor, forCharacterRange: range)
+                } else {
+                    layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: range)
+                    layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: range)
+                }
             }
         }
         for mark in current {
@@ -728,6 +771,9 @@ private final class ClickableTextView: NSTextView {
                 if mark.style == .spoken {
                     layoutManager.spokenSegments.append(range)
                     layoutManager.addTemporaryAttribute(.foregroundColor, value: tone.ink, forCharacterRange: range)
+                } else if mark.style == .listening {
+                    layoutManager.addTemporaryAttributes([.underlineStyle: NSUnderlineStyle.single.rawValue, .underlineColor: tone.ink],
+                                                         forCharacterRange: range)
                 } else {
                     layoutManager.addTemporaryAttributes([.backgroundColor: tone.fill, .foregroundColor: tone.ink],
                                                          forCharacterRange: range)
@@ -738,7 +784,7 @@ private final class ClickableTextView: NSTextView {
 
     func refreshSelectionAppearance(marks: [ReaderMark]) {
         let range = originalSelectionRange
-        let overlaps = marks.contains { $0.style != .word && $0.style != .hint && $0.style != .spoken
+        let overlaps = marks.contains { $0.style != .word && $0.style != .hint && $0.style != .spoken && $0.style != .listening
             && NSIntersectionRange($0.range, range).length > 0 }
         let background = overlaps ? NSColor.clear : NSColor.selectedTextBackgroundColor
         if (selectedTextAttributes[.backgroundColor] as? NSColor) != background {

@@ -18,6 +18,7 @@ let package = Package(
                 .copy("Resources/Readability-APACHE-2.0.txt"),
                 .copy("Resources/ExtractArticle.js"),
                 .copy("Resources/KokoroWorker.py"),
+                .copy("Resources/ListeningMark.wav"),
                 .copy("Resources/SmartRead.icns")
             ],
             linkerSettings: [

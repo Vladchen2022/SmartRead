@@ -36,12 +36,13 @@ final class AudioStudyModel {
     @ObservationIgnored private var cueInPlayback: UUID?
     @ObservationIgnored private var playbackEnd: Double?
     @ObservationIgnored private var savedPosition: Double = 0
+    @ObservationIgnored private var replayStarted: ((PlaybackSpeed) -> Void)?
 
     init(store: AudioStudyStore = AudioStudyStore(), player: AVPlayer = AVPlayer(), defaults: UserDefaults = .standard) {
         self.store = store
         self.player = player
         self.defaults = defaults
-        let speed = PlaybackSpeed(rawValue: defaults.float(forKey: "audioPlaybackSpeed")) ?? .normal
+        let speed = PlaybackSpeed(savedRate: defaults.float(forKey: "audioPlaybackSpeed"))
         playbackSpeed = speed
         player.defaultRate = speed.rawValue
     }
@@ -57,6 +58,19 @@ final class AudioStudyModel {
     var cues: [AudioStudyCue] { entry?.cues ?? [] }
     var focusedCueIndex: Int? { cues.firstIndex { $0.id == focusedCueID } }
     var canReplay: Bool { focusedCueID != nil || entry?.nextPlayableCue(at: position) != nil }
+
+    func listeningMarkReference() -> (reference: AssistantQuestionReference, time: Int64)? {
+        guard !isSeeking, let id = focusedCueID, let target = listeningTarget(for: id),
+              let time = target.milliseconds else { return nil }
+        return (target.reference, time)
+    }
+
+    private func listeningTarget(for id: UUID) -> ListeningTarget? {
+        guard let entry, let cue = cues.first(where: { $0.id == id }) else { return nil }
+        let range = NSRange(location: 0, length: cue.text.utf16.count)
+        let source = AssistantQuestionSource(title: entry.title, location: .audio(entry: entry.id, cue: id, range: range))
+        return ListeningTarget(reference: .init(passage: cue.text, source: source), milliseconds: Int64(cue.start * 1_000))
+    }
 
     func restore() {
         guard entry == nil, !isImporting else { return }
@@ -174,6 +188,7 @@ final class AudioStudyModel {
         guard entry != nil else { return }
         if !isSeeking { updatePosition() }
         player.pause()
+        replayStarted = nil
         isPlaying = false
         saveProgress()
     }
@@ -183,11 +198,9 @@ final class AudioStudyModel {
         saveProgress()
     }
 
-    func replay() {
-        if let id = focusedCueID { playCue(id, selectsForQuestion: false) }
-        else if let index = entry?.nextPlayableCue(at: position) {
-            playCue(cues[index].id, selectsForQuestion: false)
-        }
+    func replay(onStarted: ((ListeningTarget, PlaybackSpeed) -> Void)? = nil) {
+        let id = focusedCueID ?? entry?.nextPlayableCue(at: position).map { cues[$0].id }
+        if let id { playCue(id, selectsForQuestion: false, onReplayStarted: onStarted) }
     }
 
     func canMoveCue(by offset: Int) -> Bool {
@@ -200,13 +213,17 @@ final class AudioStudyModel {
         playCue(cues[target].id)
     }
 
-    func playCue(_ id: UUID, selectsForQuestion: Bool = true) {
+    func playCue(_ id: UUID, selectsForQuestion: Bool = true,
+                 onReplayStarted: ((ListeningTarget, PlaybackSpeed) -> Void)? = nil) {
         guard let index = cues.firstIndex(where: { $0.id == id }),
               let entry, let range = entry.playbackRange(for: index) else { return }
         if selectsForQuestion, let selection = AudioSubtitleSelection(entry: entry, cueID: id) {
             selectQuestionReference(selection)
         }
         move(to: range.lowerBound, play: true, cueID: id, end: range.upperBound)
+        if let onReplayStarted, let target = listeningTarget(for: id) {
+            replayStarted = { onReplayStarted(target, $0) }
+        }
     }
 
     func selectQuestionReference(_ selection: AudioSubtitleSelection) {
@@ -286,6 +303,7 @@ final class AudioStudyModel {
     }
 
     private func move(to seconds: Double, play: Bool, cueID: UUID? = nil, end: Double? = nil) {
+        replayStarted = nil
         guard seconds.isFinite, let item = player.currentItem else { return }
         let target = min(max(0, seconds), duration)
         let id = UUID()
@@ -318,6 +336,7 @@ final class AudioStudyModel {
         let end = playbackEnd ?? duration
         guard player.currentTime().seconds >= end - 0.08 else { return }
         player.pause()
+        replayStarted = nil
         position = end
         isPlaying = false
         waitingForNext = cueInPlayback != nil
@@ -329,6 +348,10 @@ final class AudioStudyModel {
         guard !isSeeking, entry != nil else { return }
         let seconds = player.currentTime().seconds
         guard seconds.isFinite else { return }
+        if let started = replayStarted, isPlaying, player.timeControlStatus == .playing, seconds > position {
+            replayStarted = nil
+            started(PlaybackSpeed(savedRate: player.rate))
+        }
         if isPlaying, player.rate == 0, seconds >= (playbackEnd ?? duration) - 0.03 {
             playbackEnded()
             return

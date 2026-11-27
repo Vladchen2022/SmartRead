@@ -201,8 +201,36 @@ final class AssistantQuestionTests: XCTestCase {
         let reopened = AssistantQuestionFavorites(file: path)
         XCTAssertEqual(reopened.entries, favorites.entries)
         XCTAssertEqual(reopened.entries.compactMap { $0.reference?.source }, Array(sources.reversed()))
+        XCTAssertEqual(reopened.entries.compactMap { $0.reference?.passage }, Array(repeating: passage, count: 3))
         try reopened.remove(try XCTUnwrap(reopened.entries.first?.id))
         XCTAssertEqual(AssistantQuestionFavorites(file: path).entries.count, 2)
+    }
+
+    @MainActor
+    func testAnswerFavoritesRequireTheTurnOriginalAndPreserveLegacyEntries() throws {
+        let root = URL.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appending(path: "question-favorites.json")
+        let legacy = AssistantQuestionFavorite(id: UUID(), question: "Old question", answer: "Old answer",
+                                               reference: nil, mode: .text, savedAt: .now)
+        try JSONEncoder().encode([legacy]).write(to: file)
+        let favorites = AssistantQuestionFavorites(file: file)
+        var turn = AssistantQuestionTurn(question: "Question", answer: "Answer", isComplete: true)
+        XCTAssertThrowsError(try favorites.toggle(turn, mode: .text))
+        turn.reference = .init(passage: "  \n")
+        XCTAssertThrowsError(try favorites.toggle(turn, mode: .text))
+        XCTAssertEqual(favorites.entries.map(\.id), [legacy.id])
+
+        let original = "She looked it up in the dictionary."
+        turn.reference = .init(passage: original, focus: "looked it up")
+        try favorites.toggle(turn, mode: .video)
+        let reopened = AssistantQuestionFavorites(file: file)
+        XCTAssertEqual(reopened.entries.first?.reference?.passage, original)
+        XCTAssertNil(reopened.entries.first?.reference?.source)
+        XCTAssertEqual(reopened.entries.last?.id, legacy.id)
+        try reopened.remove(legacy.id)
+        XCTAssertEqual(reopened.entries.map(\.id), [turn.id])
     }
 
     func testPracticeRequestsSeparateTheExerciseFromItsFeedback() throws {
@@ -244,6 +272,70 @@ final class AssistantQuestionTests: XCTestCase {
         defer { reader.cancelLookup() }
         XCTAssertEqual(reader.questionSelection?.reference.passage, next)
         XCTAssertNil(reader.questionSelection?.reference.focus)
+        XCTAssertEqual(reader.assistantTranslation?.excerpt.text, next)
+        XCTAssertNil(reader.translationAnalysis)
+
+        XCTAssertTrue(reader.clickText(at: (body as NSString).range(of: "looked").location, wholeSentence: false))
+        XCTAssertEqual(reader.lookup?.kind, .word)
+        XCTAssertEqual(reader.assistantTranslation?.excerpt.text, "She looked it up.")
+        XCTAssertEqual(reader.assistantTranslation?.surrounding?.nextSentence, next)
+        XCTAssertNil(reader.translationAnalysis)
+        XCTAssertEqual(reader.questionSelection?.reference.focus, "looked")
+        try reader.importText("The lesson is over.", title: "Another exercise")
+        XCTAssertNil(reader.assistantTranslation)
+        XCTAssertNil(reader.wordTranslation.result.completedText)
+    }
+
+    @MainActor
+    func testSelectingPartOfASentenceUsesTheWholeSentenceForPreviewAndFavorite() throws {
+        let root = URL.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let reader = ReaderModel(store: ArticleStore(root: root), learningStore: LearningRecordStore(projectRoot: root))
+        let body = "The door opened. We spoke briefly."
+        try reader.importText(body, title: "Preview")
+        XCTAssertNil(reader.selectedPreviewSentence)
+        let text = "briefly"
+        reader.selection = TextExcerpt(text: text, range: (body as NSString).range(of: text), context: "")
+        let preview = try XCTUnwrap(reader.selectedPreviewSentence)
+        XCTAssertEqual(preview.text, "We spoke briefly.")
+        XCTAssertEqual(reader.sentenceFavoriteExcerpt, preview)
+        XCTAssertFalse(reader.isSentenceFavorite(preview))
+    }
+
+    @MainActor
+    func testSentenceFavoriteUpgradesAnOriginalAndKeepsGrammarSeparate() async throws {
+        guard let model = ProcessInfo.processInfo.environment["SMARTREAD_TEST_QUESTION_MODEL"] else {
+            throw XCTSkip("Set SMARTREAD_TEST_QUESTION_MODEL to a loaded LM Studio model")
+        }
+        let root = URL.temporaryDirectory.appending(path: UUID().uuidString)
+        let suite = "SmartReadTests.SentenceFavorite.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let store = ArticleStore(root: root)
+        let reader = ReaderModel(defaults: defaults, store: store, learningStore: LearningRecordStore(projectRoot: root))
+        reader.preferredModel = model
+        try reader.importText("We put the book on the table. The room was quiet.", title: "Favorite")
+        let sentence = try XCTUnwrap(reader.articleForListening(fromHere: false).sentences.first)
+        try reader.saveFavorite(.init(kind: .originalSentence, excerpt: sentence, result: .init()))
+        try reader.saveFavorite(.init(kind: .grammar, excerpt: sentence, result: .init(analysis: "过去式")))
+        try await reader.toggleSentenceFavorite(sentence)
+
+        let saved = try XCTUnwrap(reader.favorites.first { $0.favorite.kind == .sentence }?.favorite)
+        XCTAssertEqual(saved.selectedText, sentence.text)
+        let translation = try XCTUnwrap(saved.result.translation)
+        XCTAssertTrue(translation.contains("书"), translation)
+        XCTAssertNil(saved.result.analysis)
+        XCTAssertEqual(reader.favoriteCount, 2)
+        XCTAssertTrue(reader.isSentenceFavorite(sentence))
+
+        let reopened = ReaderModel(defaults: defaults, store: store, learningStore: LearningRecordStore(projectRoot: root))
+        XCTAssertTrue(reopened.isSentenceFavorite(sentence))
+        try await reopened.toggleSentenceFavorite(sentence)
+        XCTAssertFalse(reopened.isSentenceFavorite(sentence))
+        XCTAssertEqual(reopened.favorites.map(\.favorite.kind), [.grammar])
     }
 
     func testActualLocalModelAnswersBrieflyAndStaysOnTopicWhenConfigured() async throws {

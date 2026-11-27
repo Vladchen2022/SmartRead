@@ -47,6 +47,8 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     private(set) var focusRequest: FocusRequest?
     private(set) var singleSentence = false
     private(set) var waitingForNext = false
+    private(set) var lastSpoken: TextExcerpt?
+    private(set) var isPreviewing = false
     private var sentences: [TextExcerpt] = []
     private var selectionContinuation: [TextExcerpt] = []
 
@@ -57,10 +59,11 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     private var audio: AVAudioPlayer?
     private var playbackTask: Task<Void, Never>?
     private var prefetchTask: Task<Void, Never>?
+    private var replayStarted: ((PlaybackSpeed) -> Void)?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        playbackSpeed = PlaybackSpeed(rawValue: defaults.float(forKey: "speechPlaybackSpeed")) ?? .normal
+        playbackSpeed = PlaybackSpeed(savedRate: defaults.float(forKey: "speechPlaybackSpeed"))
         engine = defaults.string(forKey: "speechEngine").flatMap(Engine.init(rawValue:)) ?? .mac
         macVoice = defaults.string(forKey: "speechMacVoice") ?? ""
         kokoroVoice = defaults.string(forKey: "speechKokoroVoice") ?? "af_heart"
@@ -87,20 +90,31 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
         Task { try? await kokoro.prepare() }
     }
 
-    func start(_ source: [TextExcerpt], at position: Int = 0, selectionContinuation: [TextExcerpt] = []) {
+    func start(_ source: [TextExcerpt], at position: Int = 0, selectionContinuation: [TextExcerpt] = [],
+               stopsAfterSentence: Bool = false, onStarted: ((PlaybackSpeed) -> Void)? = nil) {
         guard source.indices.contains(position) else { return }
         cancelOutput()
+        isPreviewing = false
         sentences = source
         self.selectionContinuation = selectionContinuation
         index = position
-        singleSentence = false
+        singleSentence = stopsAfterSentence
+        lastSpoken = nil
+        replayStarted = onStarted
         playCurrent()
     }
 
-    func replay() {
+    func preview(_ sentence: TextExcerpt) {
+        stop()
+        isPreviewing = true
+        playSpeech(sentence)
+    }
+
+    func replay(onStarted: ((PlaybackSpeed) -> Void)? = nil) {
         guard current != nil else { return }
         singleSentence = true
         cancelOutput()
+        replayStarted = onStarted
         playCurrent()
     }
 
@@ -116,8 +130,10 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     }
 
     func stop() {
+        isPreviewing = false
         cancelOutput()
         sentences = []
+        lastSpoken = nil
         selectionContinuation = []
         index = 0
         error = nil
@@ -137,6 +153,7 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     }
 
     func pause() {
+        guard !isPreviewing else { stop(); return }
         switch phase {
         case .playing:
             if let audio { audio.pause() }
@@ -151,6 +168,7 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     }
 
     private func outputChanged() {
+        if isPreviewing { stop(); return }
         guard current != nil else { return }
         let resume = isActive
         cancelOutput()
@@ -159,6 +177,7 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     }
 
     private func cancelOutput() {
+        replayStarted = nil
         playbackTask?.cancel()
         playbackTask = nil
         prefetchTask?.cancel()
@@ -189,10 +208,14 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
             return
         }
         if audio != nil || utterance != nil { cancelOutput() }
+        playSpeech(current)
+    }
+
+    private func playSpeech(_ excerpt: TextExcerpt) {
         phase = .loading
         switch engine {
         case .mac:
-            let next = AVSpeechUtterance(string: current.text)
+            let next = AVSpeechUtterance(string: excerpt.text)
             next.voice = AVSpeechSynthesisVoice(identifier: macVoice)
                 ?? macVoices.filter { $0.language == "en-US" && $0.quality != .default }
                     .max(by: { $0.quality.rawValue < $1.quality.rawValue })
@@ -206,7 +229,7 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
             playbackTask = Task { [weak self, kokoro] in
                 do {
                     if manualStep { try await Task.sleep(for: .milliseconds(90)) }
-                    let data = try await kokoro.audio(for: current.text, voice: voice)
+                    let data = try await kokoro.audio(for: excerpt.text, voice: voice)
                     guard let self, !Task.isCancelled else { return }
                     let next = try AVAudioPlayer(data: data)
                     next.delegate = self
@@ -215,7 +238,11 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
                     guard next.play() else { throw ReaderError.message("音频未能播放。") }
                     self.audio = next
                     self.phase = .playing
-                    self.prefetchNext(voice: voice)
+                    if !self.isPreviewing {
+                        self.lastSpoken = excerpt
+                        self.confirmReplay(PlaybackSpeed(savedRate: next.rate))
+                        self.prefetchNext(voice: voice)
+                    }
                 } catch {
                     guard let self, !Task.isCancelled else { return }
                     self.fail(error.localizedDescription)
@@ -236,12 +263,15 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     }
 
     private func fail(_ message: String) {
+        isPreviewing = false
         cancelOutput()
         focusRequest = nil
         error = message
     }
 
     private func finishSentence() {
+        if isPreviewing { stop(); return }
+        replayStarted = nil
         utterance = nil
         audio = nil
         if singleSentence || phase == .paused {
@@ -259,10 +289,19 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
         let id = ObjectIdentifier(utterance)
+        let speed = PlaybackSpeed(savedRate: utterance.rate / AVSpeechUtteranceDefaultSpeechRate)
         Task { @MainActor [weak self] in
             guard let self, self.phase == .loading, let utterance = self.utterance, ObjectIdentifier(utterance) == id else { return }
             self.phase = .playing
+            self.lastSpoken = self.current
+            self.confirmReplay(speed)
         }
+    }
+
+    private func confirmReplay(_ speed: PlaybackSpeed) {
+        let confirm = replayStarted
+        replayStarted = nil
+        confirm?(speed)
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {

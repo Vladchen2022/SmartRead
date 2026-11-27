@@ -13,13 +13,15 @@ struct SpeechMenu: View {
     var body: some View {
         Button { isPresented.toggle() } label: {
             HStack(spacing: 8 * interfaceScale) {
-                Label("听读", systemImage: "speaker.wave.2")
+                Label("听读", systemImage: speech.isPreviewing && speech.phase == .playing
+                      ? "speaker.wave.3.fill" : "speaker.wave.2")
                 Image(systemName: "chevron.down").imageScale(.small)
             }
         }
-        .buttonStyle(ReaderButtonStyle(prominent: isPresented, compact: true, scale: 2))
+        .buttonStyle(ReaderButtonStyle(prominent: isPresented || speech.isPreviewing, compact: true, scale: 2))
         .fixedSize()
         .accessibilityLabel("听读")
+        .accessibilityValue(previewStatus)
         .accessibilityIdentifier("speechMenu")
         .popover(isPresented: $isPresented, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 6 * interfaceScale) {
@@ -30,6 +32,7 @@ struct SpeechMenu: View {
                 )
                 Divider()
                 playButton("朗读全文", id: "speakArticle") { playArticle(false) }
+                    .help("从首句开始，读完一句就停。按 ← / → 逐句朗读，按空格连续朗读")
                 playButton("从这里听", id: "speakFromHere") { playArticle(true) }
                 if let selection {
                     playButton("朗读选区", id: "speakSelection") { playSelection(selection) }
@@ -45,6 +48,11 @@ struct SpeechMenu: View {
         .onChange(of: isPresented) { _, open in
             if !open { expandedPicker = nil }
         }
+    }
+
+    private var previewStatus: String {
+        guard speech.isPreviewing else { return "" }
+        return speech.phase == .playing ? "正在试听 · \(speech.engine.title)" : "正在准备试听 · \(speech.engine.title)"
     }
 
     private func playButton(_ title: String, id: String, action: @escaping () -> Void) -> some View {
@@ -156,22 +164,25 @@ private struct SpeechOptionPicker<Value: Hashable>: View {
 
 struct SpeechPlayerBar: View {
     let speech: ReaderSpeech
+    var captureMark: (() -> (() -> Void)?)? = nil
+    var trackedReplay: (() -> Void)? = nil
 
     var body: some View {
         let previous: (() -> Void)? = speech.hasPrevious ? { speech.move(-1) } : nil
         let next: (() -> Void)? = speech.hasNext ? { speech.move(1) } : nil
+        let speedMenu = PlaybackSpeedMenu(
+            selection: Binding(get: { speech.playbackSpeed }, set: speech.setPlaybackSpeed),
+            id: "speechPlaybackSpeed",
+            help: speech.engine == .mac ? "从下一句或重听时生效" : "即时生效"
+        )
         return ReaderPlaybackBar(
             idPrefix: "speech", isPlaying: speech.isActive, status: speech.error ?? status, hasError: speech.error != nil,
             previous: previous, toggle: { speech.toggle() }, next: next,
-            replay: { speech.replay() }, close: { speech.stop() }
+            replay: trackedReplay ?? { speech.replay() }, speedMenu: speedMenu, close: { speech.stop() }, captureMark: captureMark
         ) {
             EmptyView()
         } accessory: {
-            PlaybackSpeedMenu(
-                selection: speech.playbackSpeed, onSelect: speech.setPlaybackSpeed,
-                id: "speechPlaybackSpeed",
-                help: speech.engine == .mac ? "调整朗读速度，从下一句或重听时生效" : "调整朗读速度，即时生效"
-            )
+            EmptyView()
         }
     }
 
@@ -192,54 +203,39 @@ struct SpeechPlayerBar: View {
 }
 
 struct PlaybackSpeedMenu: View {
-    let selection: Float
-    let speeds: [Float]
-    let onSelect: (Float) -> Void
+    @Binding var selection: PlaybackSpeed
     let id: String
     let help: String
+    var isAvailable = true
     @Environment(\.readerInterfaceScale) private var scale
     @State private var isPresented = false
 
-    init(selection: PlaybackSpeed, onSelect: @escaping (PlaybackSpeed) -> Void, id: String, help: String) {
-        self.init(rate: selection.rawValue, speeds: PlaybackSpeed.allCases.map(\.rawValue), onSelect: { rate in
-            if let speed = PlaybackSpeed(rawValue: rate) { onSelect(speed) }
-        }, id: id, help: help)
-    }
-
-    init(rate: Float, speeds: [Float], onSelect: @escaping (Float) -> Void, id: String, help: String) {
-        selection = rate
-        self.speeds = speeds
-        self.onSelect = onSelect
-        self.id = id
-        self.help = help
-    }
-
-    private func title(_ rate: Float) -> String {
-        PlaybackSpeed(rawValue: rate)?.title ?? "\(rate.formatted(.number.precision(.fractionLength(0...2))))×"
+    func toggleSpeed() {
+        selection = selection == .normal ? .threeQuarters : .normal
     }
 
     var body: some View {
         Button { isPresented.toggle() } label: {
             HStack(spacing: 8 * scale) {
-                Label(selection == 1 ? "1×" : title(selection), systemImage: "speedometer")
+                Label(selection == .normal ? "1×" : selection.title, systemImage: "speedometer")
                 Image(systemName: "chevron.down").imageScale(.small)
             }
             .fixedSize()
         }
         .buttonStyle(ReaderButtonStyle(prominent: isPresented, compact: true, scale: 2))
         .accessibilityLabel("播放倍速")
-        .accessibilityValue(title(selection))
+        .accessibilityValue(selection.title)
         .accessibilityIdentifier(id)
-        .help(help)
+        .help("切换 0.75× 与原速（\(PlaybackShortcut.toggleSpeed.hint)） · \(help)")
         .popover(isPresented: $isPresented, arrowEdge: .top) {
             VStack(spacing: 6 * scale) {
-                ForEach(speeds, id: \.self) { speed in
+                ForEach(PlaybackSpeed.allCases, id: \.self) { speed in
                     Button {
-                        onSelect(speed)
+                        selection = speed
                         isPresented = false
                     } label: {
                         HStack(spacing: 10 * scale) {
-                            Text(title(speed))
+                            Text(speed.title)
                             Spacer(minLength: 0)
                             if speed == selection { Image(systemName: "checkmark").accessibilityHidden(true) }
                         }
@@ -253,6 +249,7 @@ struct PlaybackSpeedMenu: View {
             .background(ReaderPalette.chrome)
             .environment(\.readerInterfaceScale, scale)
         }
+        .disabled(!isAvailable)
     }
 }
 
@@ -265,7 +262,9 @@ struct ReaderPlaybackBar<Progress: View, Accessory: View>: View {
     let toggle: () -> Void
     let next: (() -> Void)?
     let replay: (() -> Void)?
+    let speedMenu: PlaybackSpeedMenu
     var close: (() -> Void)?
+    var captureMark: (() -> (() -> Void)?)?
     var extraShortcut: ((NSEvent) -> (() -> Void)?)?
     @ViewBuilder var progress: Progress
     @ViewBuilder var accessory: Accessory
@@ -280,7 +279,7 @@ struct ReaderPlaybackBar<Progress: View, Accessory: View>: View {
         .padding(.vertical, 12 * interfaceScale)
         .background(ReaderPalette.chrome)
         .overlay(alignment: .top) { Rectangle().fill(ReaderPalette.rule).frame(height: 1) }
-        .background(PlaybackShortcutMonitor(action: shortcutAction, extraAction: extraShortcut))
+        .background(PlaybackShortcutMonitor(action: shortcutAction, captureMark: captureMark, extraAction: extraShortcut))
     }
 
     private func shortcutAction(_ shortcut: PlaybackShortcut) -> (() -> Void)? {
@@ -289,6 +288,8 @@ struct ReaderPlaybackBar<Progress: View, Accessory: View>: View {
         case .toggle: toggle
         case .next: next
         case .replay: replay
+        case .toggleSpeed: speedMenu.isAvailable ? speedMenu.toggleSpeed : nil
+        case .markListening: captureMark?()
         }
     }
 
@@ -310,6 +311,7 @@ struct ReaderPlaybackBar<Progress: View, Accessory: View>: View {
             icon("下一句", "forward.end.fill", id: "Next", shortcut: .next, action: next)
             icon("重听", "arrow.counterclockwise", id: "Replay", shortcut: .replay, action: replay)
             if showStatus { statusLabel.fixedSize(horizontal: true, vertical: false) }
+            speedMenu
             accessory
             Spacer(minLength: 0)
             if let close { icon("关闭播放器", "xmark", id: "Close", action: close) }
@@ -330,7 +332,7 @@ struct ReaderPlaybackBar<Progress: View, Accessory: View>: View {
             .buttonStyle(ReaderButtonStyle(prominent: prominent, compact: true, scale: 2, primary: prominent))
             .accessibilityLabel(title)
             .accessibilityIdentifier(idPrefix + id)
-            .help(shortcut.map { "\(title)（\($0.hint)）" } ?? title)
+            .help(shortcut == .replay ? "单按 ↓ 重听 · 双按 ↓ 标记" : shortcut.map { "\(title)（\($0.hint)）" } ?? title)
             .disabled(action == nil)
     }
 }

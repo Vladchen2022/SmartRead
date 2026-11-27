@@ -140,6 +140,8 @@ struct VideoStudyContent: View {
     @ObservedObject var model: VideoStudyModel
     let fontSize: Double
     let subtitleWidth: CGFloat
+    let clickWholeSentence: Bool
+    var listeningMarks: [ListeningMark] = []
     let chooseVideo: () -> Void
     let openHistory: () -> Void
 
@@ -152,7 +154,8 @@ struct VideoStudyContent: View {
                 } else if model.currentSourceVideoURL != nil {
                     VideoStudyPicture(model: model, controller: model.playerController)
                     if model.canNavigateSubtitles || !model.chineseCues.isEmpty || model.subtitleNotice != nil {
-                        SubtitleBar(model: model, fontSize: fontSize, availableHeight: geometry.size.height)
+                        SubtitleBar(model: model, fontSize: fontSize, availableHeight: geometry.size.height,
+                                    clickWholeSentence: clickWholeSentence, listeningMarks: listeningMarks)
                             .frame(maxWidth: subtitleWidth)
                             .frame(maxWidth: .infinity)
                     }
@@ -208,6 +211,8 @@ private struct VideoStudyPicture: View {
 struct VideoPlayerBar: View {
     @ObservedObject var model: VideoStudyModel
     @ObservedObject var controller: PlayerController
+    var captureMark: (() -> (() -> Void)?)? = nil
+    var trackedReplay: (() -> Void)? = nil
     @Environment(\.readerInterfaceScale) private var scale
     @State private var scrubValue: Double?
 
@@ -220,16 +225,17 @@ struct VideoPlayerBar: View {
     private var playbackBar: some View {
         let previous: (() -> Void)? = model.canStep(by: -1) ? { model.step(by: -1) } : nil
         let next: (() -> Void)? = model.canStep(by: 1) ? { model.step(by: 1) } : nil
-        let replay: (() -> Void)? = model.canReplaySentence ? { model.replaySentence() } : nil
+        let replay: (() -> Void)? = model.canReplaySentence ? trackedReplay ?? { model.replaySentence() } : nil
+        let speedMenu = PlaybackSpeedMenu(
+            selection: Binding(get: { PlaybackSpeed(savedRate: controller.playbackRate) },
+                               set: { controller.playbackRate = $0.rawValue }),
+            id: "videoPlaybackSpeed", help: "即时生效", isAvailable: !model.isPreparingMedia
+        )
         return ReaderPlaybackBar(idPrefix: "video", isPlaying: model.willPlayVideo, status: status,
-                                 previous: previous, toggle: model.togglePlayback, next: next, replay: replay,
-                                 close: model.closeVideo, extraShortcut: extraShortcut) {
+                                 previous: previous, toggle: model.togglePlayback, next: next, replay: replay, speedMenu: speedMenu,
+                                 close: model.closeVideo, captureMark: captureMark, extraShortcut: extraShortcut) {
             if !model.isPreparingMedia { progress }
         } accessory: {
-            PlaybackSpeedMenu(rate: controller.playbackRate,
-                              speeds: [0.5, 0.75, 1, 1.2, 1.25, 1.5, 2], onSelect: { controller.playbackRate = $0 },
-                              id: "videoPlaybackSpeed", help: "调整视频播放速度")
-                .disabled(model.isPreparingMedia)
             soundControls.disabled(model.isPreparingMedia)
         }
     }
@@ -373,67 +379,13 @@ struct VideoHistorySheet: View {
 
 struct VideoStudyTools: View {
     @ObservedObject var model: VideoStudyModel
-    @Environment(\.readerInterfaceScale) private var scale
-    @State private var showsTools = false
-    @State private var showsCalibration = false
+    @Binding var showsCalibration: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8 * scale) {
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8 * scale) { tools; transcript }
-                VStack(alignment: .leading, spacing: 8 * scale) { tools; transcript }
-            }
-            if model.isListeningFirst {
-                Button(model.revealButtonTitle, action: model.revealSubtitle)
-                    .buttonStyle(ReaderButtonStyle(prominent: false, compact: true, scale: 1.25))
-                    .help("切换字幕阶段并播放当前句（⌥H）")
-                    .disabled(!model.canAdvanceListeningStage)
-            }
-        }
-    }
-
-    private var transcript: some View {
-        Button {
-            model.sidebarMode = .transcript
-        } label: {
-            Label("文稿", systemImage: "list.bullet.rectangle")
-        }
-        .buttonStyle(ReaderButtonStyle(prominent: model.sidebarMode == .transcript, compact: true))
-        .accessibilityIdentifier("videoTranscript")
-        .disabled(model.currentSourceVideoURL == nil)
-    }
-
-    private var tools: some View {
-        Button { showsTools.toggle() } label: {
-            HStack(spacing: 8 * scale) {
-                Label("字幕工具", systemImage: "captions.bubble")
-                Image(systemName: "chevron.down").imageScale(.small)
-            }
-        }
-        .buttonStyle(ReaderButtonStyle(prominent: showsTools, compact: true, scale: 1.25))
-        .fixedSize()
-        .accessibilityIdentifier("videoSubtitleTools")
-        .disabled(model.currentSourceVideoURL == nil)
-        .onChange(of: showsTools) { if !showsTools { showsCalibration = false } }
-        .popover(isPresented: $showsTools, arrowEdge: .bottom) {
-            if showsCalibration {
-                VideoSubtitleCalibration(model: model, isPresented: $showsCalibration)
-            } else {
-                toolOptions
-            }
-        }
-    }
-
-    private var toolOptions: some View {
-        VStack(alignment: .leading, spacing: 8 * scale) {
-            HStack {
-                SubtitleTrackMenu(model: model, language: .english)
-                SubtitleTrackMenu(model: model, language: .chinese)
-            }
-            .controlSize(.large)
-            .font(.system(size: 16 * scale))
-
-            toolButton("字幕校时…", symbol: "clock.arrow.2.circlepath") { showsCalibration = true }
+        Menu("字幕工具") {
+            SubtitleTrackMenu(model: model, language: .english)
+            SubtitleTrackMenu(model: model, language: .chinese)
+            Button("字幕校时…") { showsCalibration = true }
             if !model.sentenceBoundaryEdits.isEmpty || model.hasSentenceBoundaryOverrides {
                 Menu("调整句界") {
                     ForEach(model.sentenceBoundaryEdits) { edit in
@@ -445,28 +397,16 @@ struct VideoStudyTools: View {
                 }
                 .disabled(!model.canUseSubtitleAtPlaybackPosition)
             }
-            toolButton(model.isListeningFirst ? "退出先听后看" : "先听后看", symbol: "ear") {
+            Button(model.isListeningFirst ? "退出先听后看" : "先听后看") {
                 model.setListeningFirst(!model.isListeningFirst)
-                showsTools = false
             }
             .disabled(!model.isListeningFirst && !model.canStartListeningFirst)
-
-            toolButton(model.isSentenceLoopEnabled ? "停止单句循环" : "单句循环（⌥L）", symbol: "repeat.1") {
+            Button(model.isSentenceLoopEnabled ? "停止单句循环" : "单句循环（⌥L）") {
                 model.toggleSentenceLoop()
-                showsTools = false
             }
             .disabled(!model.canLoopCurrentSentence && !model.isSentenceLoopEnabled)
         }
-        .frame(width: 234 * scale)
-        .padding(10 * scale)
-        .background(ReaderPalette.chrome)
-        .environment(\.readerInterfaceScale, scale)
-    }
-
-    private func toolButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: symbol).frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .buttonStyle(ReaderButtonStyle(prominent: false, compact: true, scale: 1.25))
+        .accessibilityIdentifier("videoSubtitleTools")
+        .disabled(model.currentSourceVideoURL == nil)
     }
 }

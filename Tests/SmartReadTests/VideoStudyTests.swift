@@ -25,6 +25,9 @@ final class VideoStudyTests: XCTestCase {
         XCTAssertEqual(model.questionReference(currentOnly: false)?.passage, original)
         XCTAssertEqual(model.questionReference(currentOnly: false)?.focus, phrase.text)
         XCTAssertEqual(model.questionSelection?.reference.focus, phrase.text)
+        XCTAssertEqual(model.selectedSubtitle?.english, original)
+        XCTAssertEqual(model.analysisState, .idle)
+        XCTAssertFalse(model.assistantGrammarExpanded)
         let linked = try XCTUnwrap(model.questionSelection?.reference)
 
         model.step(by: 1)
@@ -35,8 +38,17 @@ final class VideoStudyTests: XCTestCase {
         XCTAssertTrue(model.questionReference(currentOnly: true)?.passage.contains("second test sentence") == true)
         XCTAssertTrue(model.questionSelection?.reference.passage.contains("second test sentence") == true)
 
-        model.analyzeAssistantSentence()
+        model.toggleAssistantGrammar()
+        XCTAssertTrue(model.assistantGrammarExpanded)
         XCTAssertEqual(model.selectedSubtitle?.english, original)
+        XCTAssertEqual(model.sidebarMode, .word)
+        XCTAssertEqual(model.questionReference(currentOnly: false)?.focus, phrase.text)
+        model.translateCurrentSubtitle()
+        XCTAssertEqual(model.sidebarMode, .analysis)
+        XCTAssertEqual(model.selectedSubtitle?.english, model.displayedEnglishText)
+        XCTAssertNil(model.questionSelection?.reference.focus)
+        XCTAssertFalse(model.assistantGrammarExpanded)
+        XCTAssertEqual(model.analysisState, .idle)
         try await model.locateQuestionSource(linked, excerpt: try XCTUnwrap(linked.linkRange(for: phrase.text)))
         XCTAssertFalse(controller.isPlaying)
         try await wait { controller.pendingSeekMilliseconds == nil && model.displayedEnglishText == original }
@@ -96,11 +108,25 @@ final class VideoStudyTests: XCTestCase {
         XCTAssertFalse(model.showEnglishSubtitle)
         XCTAssertNil(model.questionReference(currentOnly: true))
         try await wait { model.hasFinishedListeningPass && !controller.isPlaying }
+        let mark = try XCTUnwrap(model.listeningMarkReference())
+        XCTAssertTrue(mark.reference.passage.contains("third test sentence"))
+        XCTAssertFalse(model.showEnglishSubtitle)
         model.revealSubtitle()
         XCTAssertTrue(model.showEnglishSubtitle)
         XCTAssertFalse(model.showChineseSubtitle)
         try await wait { model.hasFinishedListeningPass && !controller.isPlaying }
         XCTAssertTrue(model.displayedEnglishText.contains("third test sentence"))
+        try await model.locateQuestionSource(mark.reference, excerpt: nil, reviewMark: false)
+        XCTAssertEqual(controller.currentMilliseconds, mark.time)
+        XCTAssertFalse(controller.isPlaying)
+        XCTAssertTrue(model.displayedEnglishText.contains("third test sentence"))
+        var replayed: [(String, PlaybackSpeed)] = []
+        try await model.locateQuestionSource(mark.reference, excerpt: nil, reviewMark: true) { target, speed in
+            replayed.append((target.reference.passage, speed))
+        }
+        try await wait { model.hasFinishedListeningPass && !controller.isPlaying }
+        XCTAssertEqual(replayed.map { $0.0 }, [mark.reference.passage])
+        XCTAssertEqual(replayed.map { $0.1 }, [.normal])
         model.pauseForModeSwitch()
         XCTAssertFalse(controller.isPlaying)
 

@@ -51,14 +51,15 @@ struct ReadingFeedback: Codable, Equatable, Sendable {
 
 struct LearningFavorite: Codable, Identifiable, Sendable {
     enum Kind: String, Codable, Sendable {
-        case word, phrase, sentence, grammar
+        case word, phrase, sentence, grammar, originalSentence
 
         var label: String {
             switch self {
             case .word: "单词"
             case .phrase: "搭配"
-            case .sentence: "译文"
+            case .sentence: "句子"
             case .grammar: "语法"
+            case .originalSentence: "原句"
             }
         }
     }
@@ -96,6 +97,13 @@ struct LearningFavorite: Codable, Identifiable, Sendable {
     let updatedAt: Date
     var anchorText: String? = nil
     var id: String { favoriteId }
+
+    var displayQuote: String {
+        guard kind == .grammar, !sentence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return selectedText
+        }
+        return sentence
+    }
 
     mutating func completePDFSentence(in body: String, ending: String) {
         let bodyLength = body.utf16.count

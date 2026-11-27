@@ -4,6 +4,8 @@ struct SubtitleBar: View {
     @ObservedObject var model: VideoStudyModel
     let fontSize: Double
     let availableHeight: CGFloat
+    let clickWholeSentence: Bool
+    var listeningMarks: [ListeningMark] = []
 
     var body: some View {
         ScrollView(.vertical) {
@@ -15,8 +17,17 @@ struct SubtitleBar: View {
                     selectedWord: model.displayedSelectedWord,
                     segments: model.readingFrame?.segments ?? [],
                     contentIdentity: (model.readingFrame?.context.cues ?? model.activeEnglish).map { $0.id.uuidString }.joined(separator: ","),
+                    listeningMarks: markedRanges,
                     onSelectionBegan: model.pauseForLearning,
-                    onWordClick: model.lookupDisplayedWord
+                    onWordClick: { word, sentence in
+                        guard sentence == model.displayedEnglishText,
+                              SubtitleWordTokenizer.isValidTarget(word, in: sentence) else { return }
+                        if clickWholeSentence, !word.text.contains(where: \.isWhitespace) {
+                            model.translateCurrentSubtitle()
+                        } else {
+                            model.lookupDisplayedWord(word, in: sentence)
+                        }
+                    }
                 )
                 .frame(maxWidth: .infinity)
                 .allowsHitTesting(model.canUseSubtitleAtPlaybackPosition)
@@ -65,6 +76,23 @@ struct SubtitleBar: View {
 
     private var subtitleFontSize: CGFloat {
         CGFloat(fontSize)
+    }
+
+    private var markedRanges: [NSRange] {
+        guard !listeningMarks.isEmpty else { return [] }
+        let track = model.currentEnglishTrack
+        func isMarked(_ cue: SubtitleCue) -> Bool {
+            listeningMarks.contains { $0.matches(cue, track: track) }
+        }
+        if let frame = model.readingFrame {
+            return frame.segments.filter { isMarked($0.cue) }.map(\.range)
+        }
+        var offset = 0
+        return model.activeEnglish.compactMap { cue in
+            let length = cue.text.utf16.count
+            defer { offset += length + 1 }
+            return isMarked(cue) ? NSRange(location: offset, length: length) : nil
+        }
     }
 
     private var chineseFontSize: CGFloat {

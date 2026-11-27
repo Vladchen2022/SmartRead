@@ -30,6 +30,7 @@ final class WeeklyFavoriteSync {
         do {
             let data = try Data(contentsOf: queueFile)
             let jobs = try JSONDecoder().decode([WeeklyFavoriteJob].self, from: data)
+            guard jobs.allSatisfy(\.hasOneFavorite) else { throw ReaderError.message("待写入条目缺少收藏内容。") }
             pending = Dictionary(jobs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
             // There is no queue until the first export.
@@ -71,13 +72,25 @@ final class WeeklyFavoriteSync {
     // before writing, including after a crash between creating the job and saving the favorite.
     func stage(favorite: LearningFavorite, record: LearningRecord, file: URL, webURL: URL?) {
         guard let folder else { return }
-        let job = WeeklyFavoriteJob(favorite: favorite, record: record, recordFile: file,
-                                    folder: folder, period: .init(), webURL: webURL)
+        stage(WeeklyFavoriteJob(favorite: favorite, record: record, recordFile: file,
+                                folder: folder, period: .init(), webURL: webURL))
+    }
+
+    func stage(question: AssistantQuestionFavorite, file: URL) {
+        guard let folder, let origin = question.weeklyOrigin else { return }
+        stage(WeeklyFavoriteJob(question: question, origin: origin, recordFile: file, folder: folder, period: .init()))
+    }
+
+    private func stage(_ job: WeeklyFavoriteJob) {
         do {
             try enqueue([job])
         } catch {
             status = "无法排队写入 Obsidian。收藏仍保存在 SmartRead，可用「补写本周已有收藏」重试。\(error.localizedDescription)"
         }
+    }
+
+    func reportUnresolvedQuestion(_ error: Error) {
+        status = "问答已保存在 SmartRead。无法读取泛读来源，可用「补写本周已有收藏」重试。\(error.localizedDescription)"
     }
 
     func resume() {
@@ -90,13 +103,14 @@ final class WeeklyFavoriteSync {
     }
 
     func discardPending(favoriteID: String) {
-        let remaining = pending.filter { $0.value.favorite.id != favoriteID }
+        let remaining = pending.filter { $0.value.favoriteID != favoriteID }
         guard remaining.count != pending.count else { return }
         do { try saveQueue(remaining) }
         catch { status = "无法更新待写入记录。\(error.localizedDescription)" }
     }
 
-    func backfill(records: ImportedLearningRecords, articleURLs: [URL: URL]) {
+    func backfill(records: ImportedLearningRecords, articleURLs: [URL: URL], questionFile: URL,
+                  questions: [(AssistantQuestionFavorite, WeeklyFavoriteOrigin)], unreadableQuestions: Int) {
         guard let folder, !isWorking, !queueReadFailed else { return }
         let pendingAtStart = Set(pending.keys)
         isWorking = true
@@ -105,8 +119,10 @@ final class WeeklyFavoriteSync {
             let period = WeeklyFavoritePeriod()
             let week = period.week(containing: .now)
             let sampleFile = records.file(for: .sample)
-            var jobs: [WeeklyFavoriteJob] = []
-            var unreadable = 0
+            var jobs = questions.filter { week.contains($0.0.savedAt) }.map { favorite, origin in
+                WeeklyFavoriteJob(question: favorite, origin: origin, recordFile: questionFile, folder: folder, period: period)
+            }
+            var unreadable = unreadableQuestions
             for file in try records.favoriteRecordFiles() where file != sampleFile {
                 guard let record = try? LearningRecordStore.read(file) else {
                     unreadable += 1
@@ -198,13 +214,25 @@ final class WeeklyFavoriteSync {
         var active: [WeeklyFavoriteJob] = []
         for (file, entries) in byFile {
             do {
-                let record = try LearningRecordStore.read(file)
-                let favorites = Dictionary(record.favorites.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-                for var job in entries {
-                    if record.sourceId == nil, let current = favorites[job.favorite.id] {
-                        job.favorite = current
-                        active.append(job)
-                    } else { result.finished.append(job.id) }
+                if entries.first?.question != nil {
+                    let favorites = Dictionary(try AssistantQuestionFavorites.read(file).map { ($0.id, $0) },
+                                               uniquingKeysWith: { first, _ in first })
+                    for var job in entries {
+                        if let id = job.question?.id, let current = favorites[id],
+                           current.mode == .text, current.reference?.hasOriginalPassage == true {
+                            job.question = current
+                            active.append(job)
+                        } else { result.finished.append(job.id) }
+                    }
+                } else {
+                    let record = try LearningRecordStore.read(file)
+                    let favorites = Dictionary(record.favorites.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                    for var job in entries {
+                        if let id = job.favorite?.id, record.sourceId == nil, let current = favorites[id] {
+                            job.favorite = current
+                            active.append(job)
+                        } else { result.finished.append(job.id) }
+                    }
                 }
             } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
                 result.finished += entries.map(\.id)

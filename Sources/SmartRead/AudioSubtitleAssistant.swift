@@ -26,7 +26,7 @@ struct AudioSubtitleSelection: Equatable {
         self.init(entry: entry, cueID: cueID, target: SubtitleWord(text: word.text, range: word.range))
     }
 
-    init?(entry: AudioStudyEntry, cueID: UUID, target: SubtitleWord? = nil) {
+    init?(entry: AudioStudyEntry, cueID: UUID, target: SubtitleWord? = nil, wholeSentence: Bool = false) {
         guard let cues = entry.cues, let index = cues.firstIndex(where: { $0.id == cueID }) else { return nil }
         let text = cues[index].text
         let reading = ReadingIndex(text)
@@ -35,7 +35,7 @@ struct AudioSubtitleSelection: Equatable {
         if let target {
             guard SubtitleWordTokenizer.isValidTarget(target, in: text),
                   let excerpt = sentence.focus(on: target) else { return nil }
-            word = excerpt
+            word = wholeSentence ? nil : excerpt
         } else {
             word = nil
         }
@@ -61,44 +61,73 @@ extension TextExcerpt {
 @Observable
 final class AudioSubtitleAssistant {
     private(set) var selection: AudioSubtitleSelection?
-    private(set) var action: AssistantAction?
-    private(set) var result: AssistantLookupResult = .loading("")
-    @ObservationIgnored private var task: Task<Void, Never>?
+    let word = AssistantLanguageLookup()
+    let translation = AssistantLanguageLookup()
+    let grammar = AssistantLanguageLookup()
+    private(set) var grammarExpanded = false
+    private(set) var phrase: AssistantLookupResult = .idle
+    @ObservationIgnored private var phraseTask: Task<Void, Never>?
 
     func clear() {
-        task?.cancel()
+        phraseTask?.cancel()
+        phraseTask = nil
+        word.clear()
+        translation.clear()
+        grammar.clear()
+        grammarExpanded = false
+        phrase = .idle
         selection = nil
-        action = nil
-        result = .loading("")
     }
 
-    func show(_ action: AssistantAction, for selection: AudioSubtitleSelection, using reader: ReaderModel) {
-        guard action == .sentence || selection.word != nil else { return }
-        task?.cancel()
-        self.selection = selection
-        self.action = action
-        result = .loading("")
-        task = Task { [weak self] in
+    func select(_ target: AudioSubtitleSelection, using reader: ReaderModel) {
+        clear()
+        selection = target
+        if let excerpt = target.word {
+            word.load(.init(kind: .word, excerpt: excerpt, surrounding: target.surrounding), using: reader)
+        }
+        translate(using: reader)
+    }
+
+    func translate(using reader: ReaderModel) {
+        guard let selection else { return }
+        translation.load(.init(kind: .translation, excerpt: selection.sentence, surrounding: selection.surrounding), using: reader)
+    }
+
+    func retryWord(using reader: ReaderModel) {
+        guard let selection, let excerpt = selection.word else { return }
+        word.load(.init(kind: .word, excerpt: excerpt, surrounding: selection.surrounding), using: reader)
+    }
+
+    func toggleGrammar(using reader: ReaderModel) {
+        grammarExpanded.toggle()
+        if grammarExpanded, case .idle = grammar.result { analyze(using: reader) }
+    }
+
+    func analyze(using reader: ReaderModel) {
+        guard let selection else { return }
+        grammar.load(.init(kind: .analysis, excerpt: selection.sentence, includeTranslation: false,
+                           surrounding: selection.surrounding), using: reader)
+    }
+
+    func showPhrase(using reader: ReaderModel) {
+        guard let request = selection?.phraseRequest else { return }
+        phraseTask?.cancel()
+        phrase = .loading("")
+        phraseTask = Task { [weak self] in
             do {
-                let answer: AssistantLookupResult
-                if action == .phrase, let request = selection.phraseRequest {
-                    answer = .phrase(try await reader.fetchLanguageStudy(request))
-                } else {
-                    let request = LookupRequest(kind: action == .word ? .word : .analysis,
-                                                excerpt: action == .word ? selection.word ?? selection.sentence : selection.sentence,
-                                                surrounding: selection.surrounding)
-                    let text = try await reader.fetchLanguageAnswer(request) { partial in
-                        guard !Task.isCancelled else { return }
-                        self?.result = .loading(partial)
-                    }
-                    answer = .answer(text)
-                }
-                guard !Task.isCancelled else { return }
-                self?.result = answer
+                let study = try await reader.fetchLanguageStudy(request)
+                try Task.checkCancellation()
+                self?.phrase = .phrase(study)
             } catch {
                 guard !Task.isCancelled else { return }
-                self?.result = .failed(ReaderModel.connectionMessage(error))
+                self?.phrase = .failed(ReaderModel.connectionMessage(error))
             }
         }
+    }
+
+    func hidePhrase() {
+        phraseTask?.cancel()
+        phraseTask = nil
+        phrase = .idle
     }
 }

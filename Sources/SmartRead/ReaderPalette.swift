@@ -23,6 +23,7 @@ enum ReaderPalette {
     static let mutedNS = dynamic(light: 0x6D6D6F, dark: 0xC5C7C8)
     static let accentNS = dynamic(light: 0x0064C8, dark: 0x83BFFF)
     static let wordHighlightNS = dynamic(light: 0xDDEBFC, dark: 0x344964)
+    static let listeningMarkNS = dynamic(light: 0xB53C47, dark: 0xF28690)
 
     static let ink = Color(nsColor: inkNS)
     static let paper = Color(nsColor: dynamic(light: 0xFFFFFF, dark: 0x38373C))
@@ -54,6 +55,7 @@ enum ReaderPalette {
         case .referent, .background: teal
         case .hint: pink
         case .word: Highlight(ink: inkNS, fill: wordHighlightNS)
+        case .listening: Highlight(ink: listeningMarkNS, fill: .clear)
         case .spoken: Highlight(ink: dynamic(light: 0x272923, dark: 0x272923),
                                 fill: dynamic(light: 0xFFE477, dark: 0xF7CE55))
         }

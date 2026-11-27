@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SubtitleTranscriptView: View {
     @ObservedObject var model: VideoStudyModel
+    var listeningMarks: [ListeningMark] = []
     @State private var followsPlayback = true
     @Environment(\.readerInterfaceScale) private var scale
 
@@ -26,7 +27,10 @@ struct SubtitleTranscriptView: View {
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text(SubtitleTimeLabel.string(model.videoTime(for: cue)))
                                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                                    Text(cue.text).font(.system(size: max(12, 16 * scale)))
+                                    Text(cue.text)
+                                        .underline(listeningMarks.contains { $0.matches(cue, track: model.currentEnglishTrack) },
+                                                   color: Color(nsColor: ReaderPalette.listeningMarkNS))
+                                        .font(.system(size: max(12, 16 * scale)))
                                         .fixedSize(horizontal: false, vertical: true)
                                     let chinese = model.chineseText(for: cue)
                                     if !chinese.isEmpty {

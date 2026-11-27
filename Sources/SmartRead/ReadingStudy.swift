@@ -71,7 +71,7 @@ enum StudyKind: String, CaseIterable {
 }
 
 enum MarkStyle: String, Hashable {
-    case subject, predicate, clause, modifier, referring, referent, phrase, hint, evidence, background, word, spoken
+    case subject, predicate, clause, modifier, referring, referent, phrase, hint, evidence, background, word, spoken, listening
 
     var label: String {
         switch self {
@@ -87,6 +87,7 @@ enum MarkStyle: String, Hashable {
         case .background: "背景术语"
         case .word: "查词"
         case .spoken: "当前朗读句"
+        case .listening: "听力标记"
         }
     }
 }

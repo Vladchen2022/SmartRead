@@ -3,6 +3,7 @@ import SwiftUI
 struct LearningFavoriteButton: View {
     let reader: ReaderModel
     let draft: LearningFavorite.Draft
+    var controlScale: CGFloat = 2
 
     var body: some View {
         let saved = reader.isFavorite(draft)
@@ -13,9 +14,9 @@ struct LearningFavoriteButton: View {
                 reader.notice = "无法更新收藏。\n\(error.localizedDescription)"
             }
         } label: {
-            Label(saved ? "已收藏" : "收藏\(draft.kind.label)", systemImage: saved ? "star.fill" : "star")
+            Label("\(saved ? "已收藏" : "收藏")\(draft.kind.label)", systemImage: saved ? "star.fill" : "star")
         }
-        .buttonStyle(ReaderButtonStyle(prominent: saved, compact: true, scale: 2))
+        .buttonStyle(ReaderButtonStyle(prominent: saved, compact: true, scale: controlScale))
         .help(saved ? "取消收藏\(draft.kind.label)" : "保存到\(reader.favoritesTitle)")
         .accessibilityIdentifier("favorite-\(draft.kind.rawValue)")
     }
@@ -117,8 +118,8 @@ struct ArticleFavoritesSheet: View {
                                     .accessibilityIdentifier("showSavedFavorite")
                                 Button("取消收藏") { remove(favorite) }.buttonStyle(.link)
                             }
-                            Text(favorite.selectedText).font(.headline).textSelection(.enabled)
-                            if favorite.sentence != favorite.selectedText {
+                            Text(favorite.displayQuote).font(.headline).textSelection(.enabled)
+                            if favorite.sentence != favorite.displayQuote {
                                 Text(favorite.sentence).foregroundStyle(ReaderPalette.muted).textSelection(.enabled)
                             }
                             let result = [favorite.result.definition, favorite.result.translation, favorite.result.analysis]

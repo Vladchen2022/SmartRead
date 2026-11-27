@@ -25,6 +25,7 @@ final class ReaderModel {
     private var bookLearningRecords: [LearningRecord] = []
     private(set) var isLoadingLearningRecord = false
     private(set) var shownFavorite: LearningFavorite?
+    let wordTranslation = AssistantLanguageLookup()
     private(set) var translationAnalysis: TranslationAnalysis?
     private(set) var study: ActiveStudy?
     private(set) var jump: ReadingJump?
@@ -56,6 +57,7 @@ final class ReaderModel {
     private(set) var isLoadingPDF = false
     let weeklyFavorites: WeeklyFavoriteSync
     let questionFavorites: AssistantQuestionFavorites
+    let listeningMarks: ListeningMarks
     private let questionChats: [ReaderMode: AssistantQuestionChat] = [
         .text: AssistantQuestionChat(), .audio: AssistantQuestionChat(), .video: AssistantQuestionChat()
     ]
@@ -88,6 +90,7 @@ final class ReaderModel {
         self.defaults = defaults
         self.store = store
         self.questionFavorites = AssistantQuestionFavorites(file: store.questionFavoritesFile)
+        self.listeningMarks = ListeningMarks(file: store.listeningMarksFile)
         self.pdfBooks = PDFBookStore(root: store.pdfBooksDirectory)
         self.learningStore = learningStore
         self.importedLearning = ImportedLearningRecords(root: store.importedLearningDirectory)
@@ -129,14 +132,74 @@ final class ReaderModel {
         recoveryNeeded.remove(kind)
     }
 
+    func toggleQuestionFavorite(_ turn: AssistantQuestionTurn, mode: ReaderMode) throws {
+        guard turn.isComplete else { return }
+        if questionFavorites.contains(turn.id) {
+            try removeQuestionFavorite(turn.id)
+            return
+        }
+        var origin: WeeklyFavoriteOrigin?
+        var sourceError: Error?
+        if mode == .text, let reference = turn.reference, reference.hasOriginalPassage {
+            do { origin = try weeklyQuestionOrigin(reference) }
+            catch { sourceError = error }
+        }
+        try questionFavorites.toggle(turn, mode: mode, weeklyOrigin: origin) { favorite in
+            weeklyFavorites.stage(question: favorite, file: store.questionFavoritesFile)
+        }
+        if let sourceError, weeklyFavorites.folder != nil {
+            weeklyFavorites.reportUnresolvedQuestion(sourceError)
+        } else {
+            weeklyFavorites.resume()
+        }
+    }
+
+    func removeQuestionFavorite(_ id: UUID) throws {
+        try questionFavorites.remove(id)
+        weeklyFavorites.discardPending(favoriteID: AssistantQuestionFavorite.weeklyID(for: id))
+    }
+
+    private func weeklyQuestionOrigin(_ reference: AssistantQuestionReference) throws -> WeeklyFavoriteOrigin? {
+        guard case let .text(material, range, page)? = reference.source?.location else { return nil }
+        if let page { return WeeklyFavoriteOrigin(page: page, range: range) }
+        let stored = [library.current].compactMap { $0 } + history.map(\.article)
+        guard let source = stored.first(where: { SavedReadingPosition.key(for: $0) == material }),
+              source.learningSource == nil, !source.matchesReadingItem(.sample),
+              reference.sourceRange(in: source.body, at: range, excerpt: nil) != nil else { return nil }
+        let originRecord: LearningRecord
+        if let existing = try importedLearning.load(for: source) {
+            originRecord = existing
+        } else {
+            originRecord = LearningRecord(article: source, now: .now)
+            try importedLearning.save(originRecord, for: source)
+            if material == positionKey { learningRecord = originRecord }
+        }
+        return WeeklyFavoriteOrigin(record: originRecord, range: range, webURL: source.sourceURL)
+    }
+
     func backfillWeeklyFavorites() {
+        guard weeklyFavorites.folder != nil, !weeklyFavorites.isWorking else { return }
         var articleURLs: [URL: URL] = [:]
         for source in [library.current].compactMap({ $0 }) + history.map(\.article) {
             if source.learningSource == nil, let url = source.sourceURL {
                 articleURLs[importedLearning.file(for: source)] = url
             }
         }
-        weeklyFavorites.backfill(records: importedLearning, articleURLs: articleURLs)
+        let week = WeeklyFavoritePeriod().week(containing: .now)
+        var questions: [(AssistantQuestionFavorite, WeeklyFavoriteOrigin)] = []
+        var unreadable = questionFavorites.loadError == nil ? 0 : 1
+        for favorite in questionFavorites.entries where favorite.mode == .text && week.contains(favorite.savedAt) {
+            guard let reference = favorite.reference, reference.hasOriginalPassage else { continue }
+            do {
+                if let origin = try favorite.weeklyOrigin ?? weeklyQuestionOrigin(reference) {
+                    questions.append((favorite, origin))
+                }
+            } catch {
+                unreadable += 1
+            }
+        }
+        weeklyFavorites.backfill(records: importedLearning, articleURLs: articleURLs, questionFile: store.questionFavoritesFile,
+                                 questions: questions, unreadableQuestions: unreadable)
     }
 
     func connect(to address: String? = nil) async {
@@ -396,11 +459,29 @@ final class ReaderModel {
         case .word:
             return .init(kind: .word, excerpt: lookup.excerpt, result: .init(definition: answer))
         case .translation:
-            return .init(kind: .sentence, excerpt: lookup.excerpt,
-                         result: .init(translation: answer, analysis: grammarFavorite?.result.analysis))
+            return nil
         case .analysis:
             return .init(kind: .grammar, excerpt: lookup.excerpt, result: .init(analysis: answer))
         }
+    }
+
+    var assistantTranslation: LookupRequest? {
+        guard let lookup else { return nil }
+        if lookup.kind == .translation { return lookup }
+        guard lookup.kind == .word, let sentence = index.sentence(at: lookup.excerpt.range.location),
+              canAssist(sentence) else { return nil }
+        return LookupRequest(kind: .translation, excerpt: sentence,
+                             surrounding: index.context(around: sentence.range))
+    }
+
+    func assistantDisplayExcerpt(_ excerpt: TextExcerpt) -> TextExcerpt {
+        completedBookSentence(excerpt)
+    }
+
+    func retryWordTranslation() {
+        guard lookup?.kind == .word, let request = assistantTranslation else { return }
+        wordTranslation.load(.init(kind: .translation, excerpt: completedBookSentence(request.excerpt),
+                                  surrounding: request.surrounding), using: self)
     }
 
     var grammarFavorite: LearningFavorite.Draft? {
@@ -475,36 +556,129 @@ final class ReaderModel {
     }
 
     private func savedFavoriteID(for draft: LearningFavorite.Draft) -> String? {
-        guard let record = learningRecord, let excerpt = index.excerpt(in: draft.excerpt.range) else { return nil }
-        let id = LearningFavorite.id(articleId: record.articleId, kind: draft.kind, range: excerpt.range)
+        savedFavoriteID(kind: draft.kind, excerpt: draft.excerpt)
+    }
+
+    func isSentenceFavorite(_ excerpt: TextExcerpt) -> Bool {
+        savedFavoriteID(kind: .sentence, excerpt: excerpt) != nil
+    }
+
+    func toggleSentenceFavorite(_ excerpt: TextExcerpt) async throws {
+        guard let source = index.excerpt(in: excerpt.range), canAssist(source),
+              excerpt.text == source.text || excerpt.text == completedBookSentence(source).text else { return }
+        if let id = savedFavoriteID(kind: .sentence, excerpt: source) {
+            try removeFavorite(id)
+            return
+        }
+        guard source.text.utf16.count <= 4_500 else {
+            throw ReaderError.message("选区超过 4,500 字符，请缩小范围后收藏。")
+        }
+
+        let version = articleVersion
+        let request = LookupRequest(kind: .translation, excerpt: completedBookSentence(source),
+                                    surrounding: index.context(around: source.range))
+        var translated: String?
+        if let current = assistantTranslation, index.excerpt(in: current.excerpt.range)?.range == source.range {
+            if lookup?.kind == .word { await wordTranslation.waitForResult() }
+            else { await lookupTask?.value }
+            if articleVersion == version { translated = translationText(for: current) }
+        }
+        try Task.checkCancellation()
+        guard articleVersion == version else { throw CancellationError() }
+        let translation: String
+        if let translated {
+            translation = translated
+        } else {
+            translation = try await fetchLanguageAnswer(request) { _ in }
+        }
+        try Task.checkCancellation()
+        guard articleVersion == version else { throw CancellationError() }
+        guard !translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ReaderError.message("译文为空，请重试收藏。")
+        }
+        let draft = LearningFavorite.Draft(kind: .sentence, excerpt: source, result: .init(translation: translation))
+        try saveFavorite(draft, in: article, using: index, record: editableLearningRecord(),
+                         current: true, replacingOriginal: true)
+    }
+
+    private func savedFavoriteID(kind: LearningFavorite.Kind, excerpt: TextExcerpt) -> String? {
+        guard let record = learningRecord, let normalized = index.excerpt(in: excerpt.range) else { return nil }
+        let id = LearningFavorite.id(articleId: record.articleId, kind: kind, range: normalized.range)
         return record.favorites.first(where: { $0.id == id })?.id
     }
 
     func saveFavorite(_ draft: LearningFavorite.Draft) throws {
-        guard let selected = index.excerpt(in: draft.excerpt.range),
-              selected.text == draft.excerpt.text || completedBookSentence(selected).text == draft.excerpt.text,
-              let context = index.favoriteContext(for: selected.range) else {
+        try saveFavorite(draft, in: article, using: index, record: editableLearningRecord(), current: true)
+    }
+
+    func originalFavoriteID(for mark: ListeningMark) -> String? {
+        guard case let .text(material, range, pdf) = mark.source.location else { return nil }
+        let records = pdf == nil ? [learningRecord].compactMap { $0 } : bookLearningRecords
+        for record in records {
+            let sameMaterial = record.pdfPage.map { SavedReadingPosition.key(for: $0) == material } ?? (material == positionKey)
+            guard sameMaterial, mark.reference.sourceRange(in: record.body, at: range, excerpt: nil) != nil else { continue }
+            for kind: LearningFavorite.Kind in [.sentence, .originalSentence] {
+                let id = LearningFavorite.id(articleId: record.articleId, kind: kind, range: range)
+                if record.favorites.contains(where: { $0.id == id }) { return id }
+            }
+        }
+        return nil
+    }
+
+    func toggleOriginalFavorite(for mark: ListeningMark) async throws {
+        if let id = originalFavoriteID(for: mark) {
+            try removeFavorite(id)
+            return
+        }
+        let target = try await resolveQuestionText(mark.reference, excerpt: nil)
+        let current = target.material == positionKey
+        let targetIndex = current ? index : ReadingIndex(target.article.body)
+        guard let sentence = targetIndex.excerpt(in: target.range) else {
+            throw ReaderError.message("无法在正文定位这条收藏。")
+        }
+        let draft = LearningFavorite.Draft(kind: .originalSentence, excerpt: sentence, result: .init())
+        if current {
+            try saveFavorite(draft)
+        } else {
+            let record = try importedLearning.load(for: target.article) ?? LearningRecord(article: target.article, now: .now)
+            try saveFavorite(draft, in: target.article, using: targetIndex, record: record, current: false)
+        }
+    }
+
+    private func saveFavorite(_ draft: LearningFavorite.Draft, in target: Article, using targetIndex: ReadingIndex,
+                              record: LearningRecord, current: Bool, replacingOriginal: Bool = false) throws {
+        guard let selected = targetIndex.excerpt(in: draft.excerpt.range),
+              selected.text == draft.excerpt.text || (current && completedBookSentence(selected).text == draft.excerpt.text),
+              let context = targetIndex.favoriteContext(for: selected.range) else {
             throw ReaderError.message("无法在当前正文定位这条收藏。")
         }
-        var next = try editableLearningRecord()
+        var next = record
         let range = selected.range
         let id = LearningFavorite.id(articleId: next.articleId, kind: draft.kind, range: range)
         guard !next.favorites.contains(where: { $0.id == id }) else { return }
+        let originalID = replacingOriginal ? LearningFavorite.id(articleId: next.articleId, kind: .originalSentence, range: range) : nil
+        if let originalID { next.favorites.removeAll { $0.id == originalID } }
         let now = next.touch()
         var favorite = LearningFavorite(favoriteId: id, kind: draft.kind, selectedText: selected.text,
                                         sentence: context.sentence, paragraph: context.paragraph, range: .init(range),
                                         result: draft.result, createdAt: now, updatedAt: now)
-        if let ending = article.pdfPage?.sentenceEnding {
-            favorite.completePDFSentence(in: article.body, ending: ending)
+        if let ending = target.pdfPage?.sentenceEnding {
+            favorite.completePDFSentence(in: target.body, ending: ending)
         }
         next.favorites.append(favorite)
-        if let source = library.current, source.learningSource == nil {
+        if let source = current ? library.current : target, source.learningSource == nil {
             next.importedWebURL = source.sourceURL ?? next.importedWebURL
             weeklyFavorites.stage(favorite: favorite, record: next, file: importedLearning.file(for: source),
                                   webURL: source.sourceURL)
         }
         defer { weeklyFavorites.resume() }
-        try saveLearningRecord(next)
+        if current {
+            try saveLearningRecord(next)
+        } else {
+            try importedLearning.save(next, for: target)
+            updateBookLearningRecord(next)
+        }
+        if let originalID, next.sourceId == nil { weeklyFavorites.discardPending(favoriteID: originalID) }
     }
 
     func removeFavorite(_ id: String) throws {
@@ -535,6 +709,7 @@ final class ReaderModel {
         }
         let excerpt = try favoriteExcerpt(favorite, in: index)
         cancelLookup()
+        wordTranslation.clear()
         resetTranslationAnalysis()
         dismissStudy()
         lookup = nil
@@ -745,7 +920,7 @@ final class ReaderModel {
         questionSelection = AssistantQuestionSelection(reference: reference)
     }
 
-    private func questionReference(for target: TextExcerpt) -> AssistantQuestionReference? {
+    func questionReference(for target: TextExcerpt) -> AssistantQuestionReference? {
         guard let excerpt = index.excerpt(in: target.range), canAssist(excerpt) else { return nil }
         let sentence = index.sentence(at: excerpt.range.location)
         let insideSentence = sentence.map { NSIntersectionRange($0.range, excerpt.range) == excerpt.range } ?? false
@@ -758,7 +933,17 @@ final class ReaderModel {
     }
 
     func locateQuestionSource(_ reference: AssistantQuestionReference, excerpt: NSRange?) async throws {
-        guard case let .text(material, originalRange, pdf)? = reference.source?.location else { return }
+        guard reference.source?.mode == .text else { return }
+        let target = try await resolveQuestionText(reference, excerpt: excerpt)
+        if target.material != positionKey { try adopt(target.article) }
+        jump = ReadingJump(range: target.range, select: true)
+    }
+
+    private func resolveQuestionText(_ reference: AssistantQuestionReference, excerpt: NSRange?) async throws
+        -> (article: Article, material: String, range: NSRange) {
+        guard case let .text(material, originalRange, pdf)? = reference.source?.location else {
+            throw ReaderError.message("这条记录没有可定位的正文。")
+        }
         let target: Article?
         if material == positionKey {
             target = article
@@ -776,10 +961,9 @@ final class ReaderModel {
             target = (history.map(\.article) + [Article.sample]).first { SavedReadingPosition.key(for: $0) == material }
         }
         guard let target, let range = reference.sourceRange(in: target.body, at: originalRange, excerpt: excerpt) else {
-            throw ReaderError.message("找不到这条问答的原文位置。原文可能已删除或修改。")
+            throw ReaderError.message("找不到原文位置。原文可能已删除或修改。")
         }
-        if material != positionKey { try adopt(target) }
-        jump = ReadingJump(range: range, select: true)
+        return (target, material, range)
     }
 
     var hasEnglishSelection: Bool { selection.map(canAssist) == true }
@@ -813,6 +997,46 @@ final class ReaderModel {
         return index.sentences(in: verified).map(completedBookSentence)
     }
 
+    var selectedPreviewSentence: TextExcerpt? {
+        selection.flatMap(previewSentence)
+    }
+
+    func previewSentence(_ selection: TextExcerpt) -> TextExcerpt? {
+        guard let verified = index.excerpt(in: selection.range),
+              verified.text == selection.text, canAssist(verified),
+              let sentence = index.sentence(at: verified.range.location),
+              NSIntersectionRange(sentence.range, verified.range).length > 0,
+              canAssist(sentence) else { return nil }
+        return completedBookSentence(sentence)
+    }
+
+    var sentenceFavoriteExcerpt: TextExcerpt? {
+        if let selection {
+            if let source = index.excerpt(in: selection.range), let translation = assistantTranslation,
+               index.excerpt(in: translation.excerpt.range)?.range == source.range {
+                return source
+            }
+            return previewSentence(selection)
+        }
+        if let target = study?.request?.target { return previewSentence(target) }
+        if let translation = assistantTranslation { return index.excerpt(in: translation.excerpt.range) }
+        return lookup.flatMap { previewSentence($0.excerpt) }
+    }
+
+    var textListeningMarks: [TextListeningMark] {
+        let material = article.pdfPage.map { "book:\($0.book.id)" } ?? questionMaterialID
+        return listeningMarks.marks(for: .text, materialID: material).compactMap { mark in
+            guard case let .text(key, original, _) = mark.source.location, key == questionMaterialID,
+                  let range = mark.reference.sourceRange(in: article.body, at: original, excerpt: nil) else { return nil }
+            return TextListeningMark(id: mark.id, range: range)
+        }
+    }
+
+    func listeningSentence(at range: NSRange) -> TextExcerpt? {
+        guard let excerpt = index.excerpt(in: range), canAssist(excerpt) else { return nil }
+        return completedBookSentence(excerpt)
+    }
+
     func listeningContinuation(after excerpt: TextExcerpt) -> [TextExcerpt] {
         index.articleSentences().filter { $0.range.location >= NSMaxRange(excerpt.range) && canAssist($0) }
             .map(completedBookSentence)
@@ -843,15 +1067,22 @@ final class ReaderModel {
 
     func isShowingTranslationBelow(_ lookup: LookupRequest) -> Bool {
         guard let sentence = translationSentence(lookup) else { return false }
-        return inlineTranslation == InlineTranslation(sentence: sentence.range, text: answer)
+        guard let text = translationText(for: lookup) else { return false }
+        return inlineTranslation == InlineTranslation(sentence: sentence.range, text: text)
     }
 
     func toggleInlineTranslation(for lookup: LookupRequest) {
-        guard !isLookingUp, lookupError == nil, !answer.isEmpty, let sentence = translationSentence(lookup) else { return }
-        let next = InlineTranslation(sentence: sentence.range, text: answer)
+        guard let text = translationText(for: lookup), let sentence = translationSentence(lookup) else { return }
+        let next = InlineTranslation(sentence: sentence.range, text: text)
         if inlineTranslation == next { closeInlineTranslation(); return }
         inlineTranslation = next
         jump = ReadingJump(range: sentence.range, showInline: true)
+    }
+
+    func translationText(for translation: LookupRequest) -> String? {
+        guard translation == assistantTranslation else { return nil }
+        if lookup?.kind == .word { return wordTranslation.result.completedText }
+        return lookupFinished && !answer.isEmpty ? answer : nil
     }
 
     func closeInlineTranslation() {
@@ -1037,6 +1268,7 @@ final class ReaderModel {
                                         excerpt: kind == .word ? excerpt : completedBookSentence(excerpt),
                                         surrounding: request.surrounding)
         lookupTask?.cancel()
+        wordTranslation.clear()
         resetTranslationAnalysis()
         let id = UUID()
         generation = id
@@ -1044,6 +1276,7 @@ final class ReaderModel {
         answer = ""
         lookupError = nil
         lookupFinished = false
+        if kind == .word { retryWordTranslation() }
         if kind != .word, excerpt.text.utf16.count > 4_500 {
             isLookingUp = false
             lookupError = "选区超过 4,500 字符，请缩小到一段后重试。"
@@ -1078,7 +1311,7 @@ final class ReaderModel {
     }
 
     func toggleTranslationAnalysis(for translation: LookupRequest) {
-        guard lookup == translation, translation.kind == .translation else { return }
+        guard assistantTranslation == translation else { return }
         if translationAnalysis == nil {
             translationAnalysis = TranslationAnalysis(excerpt: translation.excerpt)
             summarizeTranslation(translation)
@@ -1088,7 +1321,7 @@ final class ReaderModel {
     }
 
     func summarizeTranslation(_ translation: LookupRequest) {
-        guard lookup == translation, let analysis = translationAnalysis else { return }
+        guard assistantTranslation == translation, let analysis = translationAnalysis else { return }
         translationSummaryTask?.cancel()
         translationAnalysis?.isSummarizing = true
         translationAnalysis?.summaryError = nil
@@ -1113,7 +1346,7 @@ final class ReaderModel {
     }
 
     func toggleTranslationDetails(_ translation: LookupRequest) {
-        guard lookup == translation, let analysis = translationAnalysis else { return }
+        guard assistantTranslation == translation, let analysis = translationAnalysis else { return }
         translationAnalysis?.detailsExpanded.toggle()
         if !analysis.detailsExpanded, !analysis.finished, !analysis.isLoading, analysis.error == nil {
             analyzeTranslation(translation)
@@ -1121,9 +1354,9 @@ final class ReaderModel {
     }
 
     func analyzeTranslation(_ translation: LookupRequest) {
-        guard lookup == translation, let analysis = translationAnalysis else { return }
+        guard assistantTranslation == translation, let analysis = translationAnalysis else { return }
         stopTranslationAnalysis()
-        let excerpt = translation.excerpt
+        let excerpt = completedBookSentence(translation.excerpt)
         translationAnalysis?.answer = ""
         translationAnalysis?.finished = false
         translationAnalysis?.error = nil
@@ -1189,6 +1422,7 @@ final class ReaderModel {
 
     private func display(_ next: Article, refreshLearningSource: Bool) {
         cancelLookup()
+        wordTranslation.clear()
         resetTranslationAnalysis()
         dismissStudy()
         resetHints()

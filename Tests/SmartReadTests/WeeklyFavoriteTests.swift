@@ -62,11 +62,19 @@ final class WeeklyFavoriteTests: XCTestCase {
         try activeReader.removeFavorite(try XCTUnwrap(activeReader.favorites.first).id)
         XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), first)
 
-        try activeReader.saveFavorite(.init(kind: .grammar, excerpt: draft(content, "").excerpt,
-                                           result: .init(analysis: "过去式。")))
+        let fragment = "sat"
+        let excerpt = TextExcerpt(text: fragment, range: (content as NSString).range(of: fragment), context: "")
+        try activeReader.saveFavorite(.init(kind: .grammar, excerpt: excerpt, result: .init(analysis: "过去式。")))
+        let grammar = try XCTUnwrap(activeReader.favorites.first?.favorite)
+        XCTAssertEqual(grammar.selectedText, fragment)
+        XCTAssertEqual(grammar.displayQuote, content)
+        try activeReader.showFavorite(grammar.id)
+        XCTAssertEqual(activeReader.shownFavorite?.displayQuote, content)
+        XCTAssertEqual(activeReader.jump?.range, excerpt.range)
         try await wait(for: activeReader.weeklyFavorites)
         let appended = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(appended.contains("过去式。"))
+        XCTAssertTrue(appended.contains("> \(content)\n\n> 过去式。"))
+        XCTAssertFalse(appended.contains("> sat\n"))
         XCTAssertEqual(appended.components(separatedBy: "## Imported Web Article").count, 2)
         XCTAssertEqual(appended.components(separatedBy: "我的手写心得。").count, 2)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).count, 1)
@@ -150,6 +158,112 @@ final class WeeklyFavoriteTests: XCTestCase {
         XCTAssertEqual(restarted.weeklyFavorites.pendingCount, 0)
         XCTAssertEqual(try note(in: new).components(separatedBy: "带本书来。").count, 2)
         XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+    }
+
+    @MainActor
+    func testImportedQuestionWritesOriginalQuestionAndAnswerUnderTheArticleAndDeduplicates() async throws {
+        let (root, defaults, store) = try workspace()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = try makeFolder(WeeklyFavoriteSync.folderName, in: root)
+        let article = try Article(title: "An Imported Article", body: "Nora put the book on the table.",
+                                  sourceURL: URL(string: "https://example.com/books"))
+        try store.save(ArticleLibrary(current: article))
+        let reader = ReaderModel(defaults: defaults, store: store, learningStore: LearningRecordStore(projectRoot: root))
+        reader.weeklyFavorites.setFolder(folder)
+        let turn = try completedQuestion("What did she put down?", in: reader, answer: "The book.\nIt was on the table.")
+        try reader.toggleQuestionFavorite(turn, mode: .text)
+        try await wait(for: reader.weeklyFavorites)
+        let initial = try note(in: folder)
+        XCTAssertTrue(initial.contains("**原句**\n\n> Nora put the book on the table."))
+        XCTAssertTrue(initial.contains("**问题**\n\n> What did she put down?"))
+        XCTAssertTrue(initial.contains("**回答**\n\n> The book.\n> It was on the table."))
+        XCTAssertTrue(initial.contains("https://example.com/books"))
+        XCTAssertEqual(reader.weeklyFavorites.pendingCount, 0)
+
+        try reader.saveFavorite(draft(article.body, "诺拉把书放在桌上。"))
+        try await wait(for: reader.weeklyFavorites)
+        let combined = try note(in: folder)
+        XCTAssertEqual(combined.components(separatedBy: "## An Imported Article").count, 2)
+        XCTAssertTrue(combined.contains("诺拉把书放在桌上。"))
+        reader.backfillWeeklyFavorites()
+        try await wait(for: reader.weeklyFavorites)
+        XCTAssertEqual(try note(in: folder), combined)
+        try reader.removeQuestionFavorite(turn.id)
+        XCTAssertEqual(try note(in: folder), combined)
+    }
+
+    @MainActor
+    func testQuestionRetrySurvivesRestartAndBackfillFindsEligibleOlderFavorites() async throws {
+        let (root, defaults, store) = try workspace()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = try makeFolder(WeeklyFavoriteSync.folderName, in: root)
+        let courses = LearningRecordStore(projectRoot: root)
+        let reader = ReaderModel(defaults: defaults, store: store, learningStore: courses)
+        reader.weeklyFavorites.setFolder(folder)
+        try FileManager.default.removeItem(at: folder)
+        try reader.importText("Mia opened the window.", title: "Imported")
+        let pending = try completedQuestion("Retry this question", in: reader)
+        try reader.toggleQuestionFavorite(pending, mode: .text)
+        try await wait(for: reader.weeklyFavorites)
+        XCTAssertEqual(reader.weeklyFavorites.pendingCount, 1)
+
+        let legacy = try completedQuestion("Backfill this question", in: reader)
+        try reader.questionFavorites.toggle(legacy, mode: .text)
+        let removed = try completedQuestion("Removed pending question", in: reader)
+        try reader.toggleQuestionFavorite(removed, mode: .text)
+        try await wait(for: reader.weeklyFavorites)
+        try reader.removeQuestionFavorite(removed.id)
+        let audio = AssistantQuestionTurn(question: "Audio only question", answer: "Audio only answer", isComplete: true,
+            reference: .init(passage: "I can hear you.", source: .init(title: "Audio", location: .audio(
+                entry: UUID(), cue: UUID(), range: NSRange(location: 0, length: 15)))))
+        try reader.toggleQuestionFavorite(audio, mode: .audio)
+
+        let course = root.appending(path: "Course.md")
+        try """
+        ---
+        smartreadFormat: 1
+        sourceId: "test.course.question"
+        title: "Test Course"
+        readingDate: "2026-11-27"
+        ---
+        It belongs to the course.
+        """.write(to: course, atomically: true, encoding: .utf8)
+        try reader.importFile(course)
+        try reader.toggleQuestionFavorite(try completedQuestion("Course only question", in: reader), mode: .text)
+        let pdf = PDFBookLocation(book: .init(id: "question-pdf", title: "An Imported PDF", pageCount: 8),
+                                  index: 3, englishOnly: true, usedOCR: false, sentenceEnding: nil)
+        let pdfPassage = "He finally found the book."
+        let pdfReference = AssistantQuestionReference(passage: pdfPassage, source: .init(title: "PDF page",
+            location: .text(material: SavedReadingPosition.key(for: pdf),
+                            range: NSRange(location: 0, length: pdfPassage.utf16.count), pdf: pdf)))
+        try reader.questionFavorites.toggle(.init(question: "PDF question", answer: "PDF answer",
+                                                  isComplete: true, reference: pdfReference), mode: .text)
+
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let reopened = ReaderModel(defaults: defaults, store: store, learningStore: courses)
+        XCTAssertEqual(reopened.weeklyFavorites.pendingCount, 1)
+        XCTAssertEqual(reopened.questionFavorites.entries.count, 5)
+        reopened.weeklyFavorites.retry()
+        try await wait(for: reopened.weeklyFavorites)
+        XCTAssertTrue(try note(in: folder).contains("Retry this question"))
+        reopened.backfillWeeklyFavorites()
+        try await wait(for: reopened.weeklyFavorites)
+        let combined = try note(in: folder)
+        XCTAssertEqual(combined.components(separatedBy: "Retry this question").count, 2)
+        XCTAssertTrue(combined.contains("Backfill this question"))
+        XCTAssertTrue(combined.contains("PDF 第 4 页"))
+        XCTAssertTrue(combined.contains(pdfPassage))
+        XCTAssertTrue(combined.contains("PDF answer"))
+        XCTAssertFalse(combined.contains("Removed pending question"))
+        XCTAssertFalse(combined.contains("Course only question"))
+        XCTAssertFalse(combined.contains("Audio only question"))
+    }
+
+    @MainActor
+    private func completedQuestion(_ question: String, in reader: ReaderModel, answer: String = "Answer") throws -> AssistantQuestionTurn {
+        let sentence = try XCTUnwrap(reader.articleForListening(fromHere: false).sentences.first)
+        let reference = try XCTUnwrap(reader.questionReference(for: sentence))
+        return AssistantQuestionTurn(question: question, answer: answer, isComplete: true, reference: reference)
     }
 
     private func workspace() throws -> (URL, UserDefaults, ArticleStore) {

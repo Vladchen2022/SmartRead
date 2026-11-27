@@ -148,6 +148,7 @@ struct ArticleStore {
     let importedLearningDirectory: URL
     let weeklyFavoriteQueueFile: URL
     let questionFavoritesFile: URL
+    let listeningMarksFile: URL
 
     init(root: URL = URL.applicationSupportDirectory.appending(path: "SmartRead", directoryHint: .isDirectory)) {
         file = root.appending(path: "CurrentArticle.json")
@@ -156,6 +157,7 @@ struct ArticleStore {
         importedLearningDirectory = root.appending(path: "ImportedLearning", directoryHint: .isDirectory)
         weeklyFavoriteQueueFile = root.appending(path: "WeeklyFavoriteQueue.json")
         questionFavoritesFile = root.appending(path: "QuestionFavorites.json")
+        listeningMarksFile = root.appending(path: "ListeningMarks.json")
     }
 
     enum RecordFile: String, CaseIterable, Identifiable {
@@ -240,13 +242,15 @@ struct SavedReadingPosition: Codable, Equatable {
     var chapterOffset: Int?
 
     static func key(for article: Article) -> String {
-        if let page = article.pdfPage {
-            if let reading = page.chapter {
-                return "pdf:\(page.book.id):chapter:\(reading.chapter.id):\(reading.join.rawValue)"
-            }
-            return "pdf:\(page.book.id):\(page.index):\(page.englishOnly ? "en" : "all")"
-        }
+        if let page = article.pdfPage { return key(for: page) }
         let source = article.learningSource?.sourceId ?? article.sourceURL?.absoluteString ?? article.title
         return LearningRecord.fingerprint("\(source.utf8.count):\(source)\(article.body)")
+    }
+
+    static func key(for page: PDFBookLocation) -> String {
+        if let reading = page.chapter {
+            return "pdf:\(page.book.id):chapter:\(reading.chapter.id):\(reading.join.rawValue)"
+        }
+        return "pdf:\(page.book.id):\(page.index):\(page.englishOnly ? "en" : "all")"
     }
 }

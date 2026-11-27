@@ -94,16 +94,3 @@ extension ReaderInspector where Footer == EmptyView {
         self.init(header: header, content: content) { EmptyView() }
     }
 }
-
-struct ReaderInspectorHeading: View {
-    let title: String
-    let symbol: String
-    @Environment(\.readerInterfaceScale) private var scale
-
-    var body: some View {
-        Label(title, systemImage: symbol)
-            .font(.system(size: 24 * scale, weight: .semibold))
-            .fixedSize()
-            .accessibilityAddTraits(.isHeader)
-    }
-}

@@ -52,7 +52,7 @@ struct LookupRequest: Hashable {
     var surrounding: SentenceContext?
 }
 
-struct SentenceContext: Hashable, Codable {
+struct SentenceContext: Hashable, Codable, Sendable {
     let previousSentence: String?
     let nextSentence: String?
 }

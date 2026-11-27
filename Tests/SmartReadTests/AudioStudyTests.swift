@@ -56,6 +56,10 @@ final class AudioStudyTests: XCTestCase {
         XCTAssertEqual(reference.passage, "📖 Then look up another one.")
         XCTAssertEqual(reference.focus, "look up")
         XCTAssertEqual(reference.timestamp, "0:01")
+        let whole = try XCTUnwrap(AudioSubtitleSelection(entry: entry, cueID: cue.id, target: phrase, wholeSentence: true))
+        XCTAssertEqual(whole.sentence, selection.sentence)
+        XCTAssertNil(whole.word)
+        XCTAssertNil(whole.questionReference(in: entry)?.focus)
         let current = try XCTUnwrap(AudioSubtitleSelection(entry: entry, cueID: cue.id))
         XCTAssertEqual(current.sentence.text, "Look up the word.")
         XCTAssertNil(current.word)
@@ -118,16 +122,20 @@ final class AudioStudyTests: XCTestCase {
             XCTAssertEqual(cannot, can + 1)
             let first = model.cues[can]
             let second = model.cues[cannot]
-            model.setPlaybackSpeed(.half)
+            model.setPlaybackSpeed(.threeQuarters)
             XCTAssertEqual(player.rate, 0)
             model.playCue(first.id)
             XCTAssertEqual(model.questionSelection?.reference.passage, first.text)
             let original = try XCTUnwrap(model.questionSelection?.reference)
-            try await waitUntil { player.rate == 0.5 && player.timeControlStatus == .playing }
-            model.setPlaybackSpeed(.faster)
-            XCTAssertEqual(player.rate, 1.2)
+            try await waitUntil { player.rate == 0.75 && player.timeControlStatus == .playing }
+            let mark = try XCTUnwrap(model.listeningMarkReference())
+            XCTAssertEqual(mark.reference.passage, first.text)
+            XCTAssertTrue(model.isPlaying)
+            model.setPlaybackSpeed(.normal)
+            XCTAssertEqual(player.rate, 1)
             try await waitUntil { model.waitingForNext }
             XCTAssertEqual(model.focusedCueID, first.id)
+            XCTAssertEqual(model.listeningMarkReference()?.reference, mark.reference)
             XCTAssertTrue(model.canMoveCue(by: 1))
             XCTAssertFalse(model.isPlaying)
 
@@ -142,9 +150,12 @@ final class AudioStudyTests: XCTestCase {
             XCTAssertEqual(model.questionSelection, selected)
             XCTAssertFalse(model.isPlaying)
 
-            model.replay()
+            var replayed: [(String, PlaybackSpeed)] = []
+            model.replay { target, speed in replayed.append((target.reference.passage, speed)) }
             try await waitUntil { model.waitingForNext }
             XCTAssertEqual(model.focusedCueID, second.id)
+            XCTAssertEqual(replayed.map { $0.0 }, [second.text])
+            XCTAssertEqual(replayed.map { $0.1 }, [.threeQuarters])
 
             model.togglePlayback()
             XCTAssertTrue(model.isPlaying)

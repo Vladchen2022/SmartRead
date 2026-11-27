@@ -20,8 +20,35 @@ struct WeeklyFavoritePeriod: Sendable {
     }
 }
 
+struct WeeklyFavoriteOrigin: Codable, Equatable, Sendable {
+    let sourceID: String
+    let title: String
+    let webURL: URL?
+    let pdfLocation: String?
+
+    init(record: LearningRecord, range: NSRange, webURL: URL? = nil) {
+        if let page = record.pdfPage {
+            self = Self(page: page, range: range, webURL: record.importedWebURL ?? webURL)
+        } else {
+            sourceID = record.articleId.uuidString.lowercased()
+            title = record.title
+            self.webURL = record.importedWebURL ?? webURL
+            pdfLocation = nil
+        }
+    }
+
+    init(page: PDFBookLocation, range: NSRange, webURL: URL? = nil) {
+        sourceID = "pdf:" + page.book.id
+        title = page.book.title
+        self.webURL = webURL
+        let label = "PDF 第 \(page.sourcePage(at: range.location) + 1) 页"
+        pdfLocation = page.chapter.map { "\($0.chapter.label) · \(label)" } ?? label
+    }
+}
+
 struct WeeklyFavoriteJob: Codable, Sendable {
-    var favorite: LearningFavorite
+    var favorite: LearningFavorite?
+    var question: AssistantQuestionFavorite?
     let recordFile: URL
     var folder: URL
     let weekStart: String
@@ -33,26 +60,36 @@ struct WeeklyFavoriteJob: Codable, Sendable {
 
     init(favorite: LearningFavorite, record: LearningRecord, recordFile: URL, folder: URL,
          period: WeeklyFavoritePeriod, webURL: URL? = nil) {
-        self.favorite = favorite
-        self.recordFile = recordFile
-        self.folder = folder
-        weekStart = period.label(for: period.week(containing: favorite.createdAt).start)
-        day = period.label(for: favorite.createdAt)
-        self.webURL = record.importedWebURL ?? webURL
-        if let page = record.pdfPage {
-            sourceID = "pdf:" + page.book.id
-            title = page.book.title
-            let label = "PDF 第 \(page.sourcePage(at: favorite.range.location) + 1) 页"
-            pdfLocation = page.chapter.map { "\($0.chapter.label) · \(label)" } ?? label
-        } else {
-            sourceID = record.articleId.uuidString.lowercased()
-            title = record.title
-            pdfLocation = nil
-        }
+        let range = NSRange(location: favorite.range.location, length: favorite.range.length)
+        self.init(favorite: favorite, question: nil, date: favorite.createdAt, recordFile: recordFile,
+                  folder: folder, period: period, origin: .init(record: record, range: range, webURL: webURL))
     }
 
+    init(question: AssistantQuestionFavorite, origin: WeeklyFavoriteOrigin, recordFile: URL, folder: URL,
+         period: WeeklyFavoritePeriod) {
+        self.init(favorite: nil, question: question, date: question.savedAt, recordFile: recordFile,
+                  folder: folder, period: period, origin: origin)
+    }
+
+    private init(favorite: LearningFavorite?, question: AssistantQuestionFavorite?, date: Date, recordFile: URL,
+                 folder: URL, period: WeeklyFavoritePeriod, origin: WeeklyFavoriteOrigin) {
+        self.favorite = favorite
+        self.question = question
+        self.recordFile = recordFile
+        self.folder = folder
+        weekStart = period.label(for: period.week(containing: date).start)
+        day = period.label(for: date)
+        sourceID = origin.sourceID
+        title = origin.title
+        webURL = origin.webURL
+        pdfLocation = origin.pdfLocation
+    }
+
+    var hasOneFavorite: Bool { (favorite != nil) != (question != nil) }
+    var date: Date { favorite?.createdAt ?? question?.savedAt ?? .distantPast }
+    var favoriteID: String { favorite?.id ?? question?.weeklyID ?? "" }
     var noteURL: URL { folder.appending(path: "\(weekStart) 英语泛读沉淀.md") }
-    var entryID: String { LearningRecord.fingerprint(favorite.id) }
+    var entryID: String { LearningRecord.fingerprint(favoriteID) }
     var id: String { noteURL.path + "\n" + entryID }
 }
 
@@ -94,8 +131,7 @@ enum WeeklyFavoriteNotes {
                 var updated = original ?? "# \(first.weekStart) 英语泛读沉淀\n"
                 var appended = 0
                 for job in jobs.sorted(by: {
-                    $0.favorite.createdAt == $1.favorite.createdAt ? $0.entryID < $1.entryID :
-                        $0.favorite.createdAt < $1.favorite.createdAt
+                    $0.date == $1.date ? $0.entryID < $1.entryID : $0.date < $1.date
                 }) {
                     if try insert(job, in: &updated) { appended += 1 }
                 }
@@ -145,9 +181,15 @@ enum WeeklyFavoriteNotes {
     }
 
     private static func render(_ job: WeeklyFavoriteJob, marker: String) -> String {
-        let favorite = job.favorite
         let location = job.pdfLocation.map { " · " + escape($0) } ?? ""
-        var lines = [marker, "**\(job.day) · \(favorite.kind.label)\(location)**", "", quote(favorite.selectedText)]
+        if let question = job.question, let reference = question.reference {
+            let fields = [("原句", reference.passage), ("问题", question.question), ("回答", question.answer)]
+            return ([marker, "**\(job.day) · 问答\(location)**"] + fields.flatMap { title, text in
+                ["", "**\(title)**", "", quote(text)]
+            }).joined(separator: "\n") + "\n"
+        }
+        guard let favorite = job.favorite else { return "" }
+        var lines = [marker, "**\(job.day) · \(favorite.kind.label)\(location)**", "", quote(favorite.displayQuote)]
         if favorite.sentence != favorite.selectedText, favorite.kind == .word || favorite.kind == .phrase {
             lines += ["", "例句", quote(favorite.sentence)]
         }

@@ -42,6 +42,7 @@ struct ReaderPreferences: DynamicProperty {
     @AppStorage("clickWholeSentence") var clickWholeSentence = false
     @AppStorage("listeningMaskOpacity") var listeningMaskOpacity = 0.7
     @AppStorage("highlightsSpokenSentence") var highlightsSpokenSentence = true
+    @AppStorage("listeningMarkSound") var listeningMarkSound = true
 
     func restoreLayout() {
         interfaceSize = .large
@@ -219,6 +220,10 @@ struct ReaderSettings: View {
             Section("语音") {
                 SpeechOutputOptions(speech: speech)
                     .pickerStyle(.menu)
+            }
+            Section("听力标记") {
+                Toggle("标记成功时播放提示音", isOn: preferences.$listeningMarkSound)
+                    .accessibilityIdentifier("settingsListeningMarkSound")
             }
             Section("播放时的正文") {
                 Toggle("用黄色标出当前朗读句", isOn: preferences.$highlightsSpokenSentence)

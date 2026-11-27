@@ -3,6 +3,7 @@ import SwiftUI
 struct AssistantQuestionFavoritesSheet: View {
     let favorites: AssistantQuestionFavorites
     let locate: (AssistantQuestionReference, NSRange?) async throws -> Void
+    let removeFavorite: (UUID) throws -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var selection: AssistantQuestionFavorite.ID?
@@ -37,8 +38,11 @@ struct AssistantQuestionFavoritesSheet: View {
                         if let selected {
                             VStack(alignment: .leading, spacing: 10) {
                                 Text(sourceLabel(selected)).font(.caption).foregroundStyle(.secondary)
-                                if let quote = selected.reference?.passage {
-                                    Text(quote).font(.system(size: 16, design: .serif)).textSelection(.enabled)
+                                if let reference = selected.reference, reference.hasOriginalPassage {
+                                    Text(reference.passage).font(.system(size: 16, design: .serif)).textSelection(.enabled)
+                                        .accessibilityIdentifier("assistantFavoriteOriginal")
+                                } else {
+                                    Text("这条历史收藏缺少原句。").font(.caption).foregroundStyle(ReaderPalette.muted)
                                 }
                                 Text(selected.question).font(.headline).textSelection(.enabled)
                                 AnswerText(answer: selected.answer, fontSize: 15)
@@ -84,7 +88,7 @@ struct AssistantQuestionFavoritesSheet: View {
     private func remove() {
         guard let selected else { return }
         do {
-            try favorites.remove(selected.id)
+            try removeFavorite(selected.id)
             selection = favorites.entries.first?.id
         } catch { self.error = error.localizedDescription }
     }

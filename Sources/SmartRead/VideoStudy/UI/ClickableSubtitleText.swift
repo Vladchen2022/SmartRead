@@ -10,6 +10,7 @@ struct ClickableSubtitleText: NSViewRepresentable {
     var alignment: NSTextAlignment = .center
     var usesSerif = false
     var foreground: NSColor? = nil
+    var listeningMarks: [NSRange] = []
     var onSelectionBegan: (() -> Void)? = nil
     let onWordClick: (SubtitleWord, String) -> Void
 
@@ -22,7 +23,7 @@ struct ClickableSubtitleText: NSViewRepresentable {
         view.onSelectionBegan = onSelectionBegan
         view.configure(text: text, fontSize: fontSize, selectedWord: selectedWord,
             segments: segments, contentIdentity: contentIdentity,
-            alignment: alignment, usesSerif: usesSerif, foreground: foreground)
+            alignment: alignment, usesSerif: usesSerif, foreground: foreground, listeningMarks: listeningMarks)
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: SubtitleWordView, context: Context) -> CGSize? {
@@ -49,6 +50,7 @@ final class SubtitleWordView: NSView {
     private var alignment: NSTextAlignment = .center
     private var usesSerif = false
     private var foreground: NSColor?
+    private var listeningMarks: [NSRange] = []
     private var hoveredWord: SubtitleWord?
     private var pressedWord: SubtitleWord?
     private var draggedSelection: SubtitleWord?
@@ -80,10 +82,12 @@ final class SubtitleWordView: NSView {
 
     func configure(text: String, fontSize: CGFloat, selectedWord: SubtitleWord?,
                    segments: [SubtitleReadingSegment] = [], contentIdentity: String? = nil,
-                   alignment: NSTextAlignment = .center, usesSerif: Bool = false, foreground: NSColor? = nil) {
+                   alignment: NSTextAlignment = .center, usesSerif: Bool = false, foreground: NSColor? = nil,
+                   listeningMarks: [NSRange] = []) {
         guard self.text != text || self.fontSize != fontSize || self.selectedWord != selectedWord
             || self.segments != segments || self.contentIdentity != contentIdentity
-            || self.alignment != alignment || self.usesSerif != usesSerif || self.foreground != foreground else { return }
+            || self.alignment != alignment || self.usesSerif != usesSerif || self.foreground != foreground
+            || self.listeningMarks != listeningMarks else { return }
         let changedText = self.text != text || self.contentIdentity != contentIdentity
         self.text = text
         self.fontSize = fontSize
@@ -93,6 +97,9 @@ final class SubtitleWordView: NSView {
         self.usesSerif = usesSerif
         self.foreground = foreground
         let length = (text as NSString).length
+        self.listeningMarks = listeningMarks.filter {
+            $0.location >= 0 && $0.location <= length && $0.length > 0 && $0.length <= length - $0.location
+        }
         self.segments = segments.filter { $0.range.location >= 0 && $0.range.location <= length && $0.range.length <= length - $0.range.location }
         words = SubtitleWordTokenizer.words(in: text)
         setAccessibilityValue(text)
@@ -140,6 +147,10 @@ final class SubtitleWordView: NSView {
         }
         if let hoveredWord {
             storage.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: hoveredWord.range)
+        }
+        for range in listeningMarks {
+            storage.addAttributes([.underlineStyle: NSUnderlineStyle.single.rawValue,
+                                   .underlineColor: ReaderPalette.listeningMarkNS], range: range)
         }
     }
 

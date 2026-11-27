@@ -49,18 +49,23 @@ final class SpeechTests: XCTestCase {
         XCTAssertEqual(PlaybackShortcut(event: try event("\u{F702}", modifiers: [.numericPad, .function])), .previous)
         XCTAssertEqual(PlaybackShortcut(event: try event("\u{F703}", modifiers: [.numericPad, .function])), .next)
         XCTAssertEqual(PlaybackShortcut(event: try event("\u{F701}", modifiers: [.numericPad, .function])), .replay)
+        XCTAssertEqual(PlaybackShortcut(event: try event("\u{F700}", modifiers: [.numericPad, .function])), .toggleSpeed)
+        XCTAssertNil(PlaybackShortcut(event: try event("\u{F700}", modifiers: [.command, .function])))
+        XCTAssertNil(PlaybackShortcut(event: try event("\u{F701}", modifiers: [.command, .function])))
         XCTAssertNil(PlaybackShortcut(event: try event("\u{F701}", modifiers: [.shift, .function])))
         XCTAssertNil(PlaybackShortcut(event: try event("r")))
         XCTAssertNil(PlaybackShortcut(event: try event("s")))
         XCTAssertNil(PlaybackShortcut(event: try event("s", modifiers: .command)))
         XCTAssertNil(PlaybackShortcut(event: try event(" ", modifiers: .shift)))
         XCTAssertNil(PlaybackShortcut(event: try event("a")))
+        XCTAssertEqual(PlaybackShortcut(event: try event("m")), .markListening)
+        XCTAssertNil(PlaybackShortcut(event: try event("m", modifiers: .command)))
     }
 
     @MainActor
     func testSpeedButtonScalesWithTheReaderInterface() {
         func size(_ setting: ReaderInterfaceSize) -> CGSize {
-            let menu = PlaybackSpeedMenu(selection: .normal, onSelect: { _ in }, id: "testSpeed", help: "调整倍速")
+            let menu = PlaybackSpeedMenu(selection: .constant(.normal), id: "testSpeed", help: "调整倍速")
                 .environment(\.readerInterfaceScale, setting.scale)
             return NSHostingView(rootView: menu).fittingSize
         }
@@ -100,7 +105,7 @@ final class SpeechTests: XCTestCase {
         let suite = "SmartReadTests.Speech.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        defaults.set(PlaybackSpeed.faster.rawValue, forKey: "audioPlaybackSpeed")
+        defaults.set(Float(1.2), forKey: "audioPlaybackSpeed")
         let speech = ReaderSpeech(defaults: defaults)
         XCTAssertEqual(speech.playbackSpeed, .normal)
 
@@ -110,14 +115,32 @@ final class SpeechTests: XCTestCase {
         speech.pause()
         let focus = speech.focusRequest
 
-        speech.setPlaybackSpeed(.threeQuarters)
+        let menu = PlaybackSpeedMenu(
+            selection: Binding(get: { speech.playbackSpeed }, set: speech.setPlaybackSpeed),
+            id: "testSpeed", help: "调整倍速"
+        )
+        menu.toggleSpeed()
 
         XCTAssertEqual(speech.phase, .paused)
         XCTAssertEqual(speech.focusRequest, focus)
         XCTAssertEqual(speech.current?.text, sentences[0].text)
         XCTAssertTrue(speech.singleSentence)
         XCTAssertEqual(ReaderSpeech(defaults: defaults).playbackSpeed, .threeQuarters)
-        XCTAssertEqual(defaults.float(forKey: "audioPlaybackSpeed"), PlaybackSpeed.faster.rawValue)
+        XCTAssertEqual(defaults.float(forKey: "audioPlaybackSpeed"), 1.2)
+        menu.toggleSpeed()
+        XCTAssertEqual(speech.playbackSpeed, .normal)
+        XCTAssertEqual(speech.phase, .paused)
+        XCTAssertEqual(speech.current?.text, sentences[0].text)
+    }
+
+    func testSavedSpeedsConvergeOnTheTwoSupportedRates() {
+        XCTAssertEqual(PlaybackSpeed.allCases, [.threeQuarters, .normal])
+        XCTAssertEqual(PlaybackSpeed(savedRate: 0), .normal)
+        XCTAssertEqual(PlaybackSpeed(savedRate: 0.5), .threeQuarters)
+        XCTAssertEqual(PlaybackSpeed(savedRate: 0.75), .threeQuarters)
+        XCTAssertEqual(PlaybackSpeed(savedRate: 1), .normal)
+        XCTAssertEqual(PlaybackSpeed(savedRate: 1.2), .normal)
+        XCTAssertEqual(PlaybackSpeed(savedRate: 2), .normal)
     }
 
     @MainActor
@@ -149,6 +172,35 @@ final class SpeechTests: XCTestCase {
         XCTAssertEqual(speech.phase, .ready)
         XCTAssertNil(speech.focusRequest)
         XCTAssertNil(speech.current)
+    }
+
+    @MainActor
+    func testPreviewStartsWithoutAListeningFocusAndCanBeReplacedByNormalPlayback() throws {
+        let suite = "SmartReadTests.Speech.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let speech = ReaderSpeech(defaults: defaults)
+        let sentences = ReadingIndex("She paused. Then she spoke.").articleSentences()
+        speech.start(sentences, at: 1)
+        let focus = try XCTUnwrap(speech.focusRequest)
+
+        speech.preview(sentences[0])
+        XCTAssertTrue(speech.isPreviewing)
+        XCTAssertTrue(speech.isActive)
+        XCTAssertNil(speech.focusRequest)
+        XCTAssertNil(speech.current)
+        XCTAssertNil(speech.lastSpoken)
+        speech.focusArrived(focus.id)
+        XCTAssertTrue(speech.isPreviewing)
+
+        speech.start(sentences, at: 1)
+        XCTAssertFalse(speech.isPreviewing)
+        XCTAssertEqual(speech.focusRequest?.range, sentences[1].range)
+        speech.preview(sentences[1])
+        speech.pause()
+        XCTAssertFalse(speech.isPreviewing)
+        XCTAssertEqual(speech.phase, .ready)
+        XCTAssertNil(speech.focusRequest)
     }
 
     @MainActor

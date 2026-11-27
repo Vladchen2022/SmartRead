@@ -4,9 +4,10 @@ enum SelectionActionPlacement {
     static let wordSize = CGSize(width: 256, height: 56)
     static let selectionSize = CGSize(width: 225, height: 56)
 
-    static func size(forWord: Bool, scale: CGFloat) -> CGSize {
-        let base = forWord ? wordSize : selectionSize
-        return CGSize(width: base.width * scale, height: base.height * scale)
+    static func size(forWord: Bool, hasLanguageActions: Bool = true, hasMark: Bool = false, scale: CGFloat) -> CGSize {
+        let languageWidth = hasLanguageActions ? (forWord ? wordSize.width : selectionSize.width) : 52
+        let width = languageWidth + (hasMark ? 106 : 0)
+        return CGSize(width: width * scale, height: selectionSize.height * scale)
     }
 
     static func frame(near lines: [CGRect], in viewport: CGRect, prefersStart: Bool, size: CGSize) -> CGRect? {
@@ -47,6 +48,8 @@ enum SelectionActionPlacement {
 
 struct SelectionActions: View {
     var wordAction: WordAction?
+    let hasLanguageActions: Bool
+    var cancelMark: (() -> Void)?
     let scale: CGFloat
     let translation: () -> Void
     let speak: () -> Void
@@ -60,19 +63,25 @@ struct SelectionActions: View {
     }
 
     var body: some View {
-        let size = SelectionActionPlacement.size(forWord: wordAction != nil, scale: scale)
+        let size = SelectionActionPlacement.size(forWord: wordAction != nil, hasLanguageActions: hasLanguageActions,
+                                                 hasMark: cancelMark != nil, scale: scale)
         HStack(spacing: 5 * scale) {
-            if let wordAction {
+            if hasLanguageActions, let wordAction {
                 button("看整句", symbol: "text.cursor", identifier: "wordAction-sentence", prominent: true,
                        help: "选中整句并在右侧显示译文", action: translateSentence)
                 button(wordAction.study == .reference ? "看指代" : "看搭配",
                        symbol: wordAction.study.symbol, identifier: "wordAction-study", prominent: false,
                        help: wordAction.study.label) { wordStudy(wordAction.study) }
-            } else {
+            } else if hasLanguageActions {
                 button("翻译", symbol: LookupKind.translation.symbol, identifier: "selectionAction-translation",
                        prominent: true, help: "翻译选区（⇧⌘T）", action: translation)
-                button("朗读", symbol: "speaker.wave.2", identifier: "selectionAction-speak",
-                       prominent: false, help: "朗读选区", action: speak)
+                button("试听", symbol: "speaker.wave.2", identifier: "selectionAction-speak",
+                       prominent: false, help: "临时朗读选中句子（普通阅读时按空格）", action: speak)
+            }
+            if let cancelMark {
+                button("取消标记", symbol: "bookmark.slash", identifier: "selectionAction-cancelMark",
+                       prominent: false, help: "取消这句的听力标记", action: cancelMark)
+                    .frame(width: 101 * scale)
             }
             iconButton("关闭浮窗", symbol: "xmark", identifier: "readingActions-close", action: close)
         }

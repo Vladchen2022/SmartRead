@@ -56,9 +56,12 @@ final class VideoStudyModel: ObservableObject {
         didSet { subtitleTrackChanged(.chinese) }
     }
     @Published private(set) var activeEnglish: [SubtitleCue] = []
+    @Published private var positionedListeningMark: SubtitleSentenceContext?
+    private var replayStarted: ((PlaybackSpeed) -> Void)?
     @Published private(set) var activeChinese: [SubtitleCue] = []
     @Published private(set) var selectedSubtitle: SubtitleSelection?
     @Published private(set) var analysisState: AnalysisState = .idle
+    @Published private(set) var assistantGrammarExpanded = false
     @Published private(set) var selectedWordRequest: WordLookupRequest?
     @Published private(set) var questionSelection: AssistantQuestionSelection?
     @Published private(set) var wordLookupState: WordLookupState = .idle
@@ -278,6 +281,9 @@ final class VideoStudyModel: ObservableObject {
     var usesSentenceReading: Bool { englishReadingMode == .sentence || isListeningFirst }
 
     var readingFrame: SubtitleReadingFrame? {
+        if let mark = pendingListeningMark, let first = mark.cues.first {
+            return SubtitleReadingFrame(context: mark, at: first.startMilliseconds)
+        }
         if usesSentenceReading, let practice = listeningPractice {
             let time = hasFinishedListeningPass ? practice.endMilliseconds - 1
                 : min(practice.endMilliseconds - 1, max(practice.startMilliseconds, playerController.confirmedMilliseconds))
@@ -285,6 +291,13 @@ final class VideoStudyModel: ObservableObject {
         }
         guard usesSentenceReading else { return nil }
         return readingTimeline.frame(at: sourceTime(playerController.confirmedMilliseconds, for: .english))
+    }
+
+    private var pendingListeningMark: SubtitleSentenceContext? {
+        guard let mark = positionedListeningMark, let first = mark.cues.first,
+              !playerController.isPlaying, !playerController.isStarting,
+              playerController.pendingSeekMilliseconds == videoTime(for: first) else { return nil }
+        return mark
     }
 
     var displayedEnglishText: String { readingFrame?.text ?? activeEnglishText }
@@ -308,7 +321,10 @@ final class VideoStudyModel: ObservableObject {
     private func subtitleTrackChanged(_ language: SubtitleLanguage) {
         let cues = language == .english ? englishCues : chineseCues
         activeTrackKeys[language] = nil
-        if language == .english { sentenceBoundaries = [:] }
+        if language == .english {
+            sentenceBoundaries = [:]
+            positionedListeningMark = nil
+        }
         if let video = currentSourceVideoURL, !cues.isEmpty {
             let identity = currentVideoRecord?.id.uuidString ?? SubtitleCalibration.storageKey(for: video)
             let track = language == .english ? selectedEnglishEmbeddedTrackID : selectedChineseEmbeddedTrackID
@@ -393,6 +409,18 @@ final class VideoStudyModel: ObservableObject {
 
     private var playbackUnitCues: [SubtitleCue] { readingFrame?.context.cues ?? activeEnglish }
 
+    func listeningMarkReference() -> (reference: AssistantQuestionReference, time: Int64)? {
+        guard canNavigateSubtitles, canUseSubtitleAtPlaybackPosition else { return nil }
+        let time = sourceTime(playerController.confirmedMilliseconds, for: .english)
+        var cues = listeningPractice?.context.cues ?? playbackUnitCues
+        if cues.isEmpty, let previous = englishTimeline.previousCue(at: time),
+           (0...1_500).contains(time - previous.endMilliseconds) {
+            cues = usesSentenceReading ? readingTimeline.frame(at: previous.startMilliseconds)?.context.cues ?? [previous] : [previous]
+        }
+        guard let first = cues.first, let reference = questionReference(for: SubtitleSentenceContext(cues: cues)) else { return nil }
+        return (reference, videoTime(for: first))
+    }
+
     func setEnglishReadingMode(_ mode: EnglishReadingMode) {
         guard mode != englishReadingMode else { return }
         stopSentenceLoop()
@@ -414,7 +442,7 @@ final class VideoStudyModel: ObservableObject {
     }
 
     var canUseSubtitleAtPlaybackPosition: Bool {
-        !isPreparingMedia && (playerController.pendingSeekMilliseconds == nil || hasFinishedListeningPass)
+        !isPreparingMedia && (playerController.pendingSeekMilliseconds == nil || hasFinishedListeningPass || pendingListeningMark != nil)
     }
 
     var isSentenceLoopEnabled: Bool {
@@ -486,9 +514,10 @@ final class VideoStudyModel: ObservableObject {
                                  duration: playerController.durationMilliseconds)
     }
 
-    private func replayListeningPass() {
+    private func replayListeningPass(onStarted: ((PlaybackSpeed) -> Void)? = nil) {
         guard let practice = listeningPractice else { return }
         cancelListeningBoundary()
+        replayStarted = onStarted
         // Cancel a queued continuous-loop restart without turning that option off.
         sentenceLoopRestartTask?.cancel()
         sentenceLoopRestartTask = nil
@@ -499,6 +528,7 @@ final class VideoStudyModel: ObservableObject {
     }
 
     private func cancelListeningBoundary() {
+        replayStarted = nil
         listeningPlaybackGeneration = UUID()
         listeningBoundaryTask?.cancel()
         listeningBoundaryTask = nil
@@ -608,15 +638,22 @@ final class VideoStudyModel: ObservableObject {
 
     func openDroppedVideoFile(_ url: URL) { _ = openDroppedVideo([url]) }
 
-    func replaySentence() {
-        if listeningPractice != nil, isListeningFirst {
+    func replaySentence(onStarted: ((ListeningTarget, PlaybackSpeed) -> Void)? = nil) {
+        if let practice = listeningPractice, isListeningFirst {
             stopSentenceLoop()
-            replayListeningPass()
+            replayListeningPass(onStarted: replayConfirmation(for: practice, onStarted))
             return
         }
         guard canUseSubtitleAtPlaybackPosition,
               let pass = listeningPractice ?? playbackPass(for: playbackUnitCues.first) else { return }
-        playOnce(pass)
+        playOnce(pass, onStarted: replayConfirmation(for: pass, onStarted))
+    }
+
+    private func replayConfirmation(for pass: ListeningPractice, _ onStarted: ((ListeningTarget, PlaybackSpeed) -> Void)?)
+        -> ((PlaybackSpeed) -> Void)? {
+        guard let onStarted, let reference = questionReference(for: pass.context) else { return nil }
+        let target = ListeningTarget(reference: reference, milliseconds: pass.startMilliseconds)
+        return { onStarted(target, $0) }
     }
 
     private func destination(by offset: Int) -> SubtitleCue? {
@@ -639,10 +676,11 @@ final class VideoStudyModel: ObservableObject {
                                  duration: playerController.durationMilliseconds)
     }
 
-    private func playOnce(_ pass: ListeningPractice) {
+    private func playOnce(_ pass: ListeningPractice, onStarted: ((PlaybackSpeed) -> Void)? = nil) {
+        positionedListeningMark = nil
         stopSentenceLoop()
         listeningPractice = pass
-        replayListeningPass()
+        replayListeningPass(onStarted: onStarted)
     }
 
     private func clearPlaybackPass() {
@@ -662,6 +700,7 @@ final class VideoStudyModel: ObservableObject {
     }
 
     func togglePlayback() {
+        positionedListeningMark = nil
         // Space may arrive before the asynchronous loader has submitted play.
         // Remember that intent instead of having auto-play override the pause.
         if isPreparingMedia {
@@ -683,6 +722,7 @@ final class VideoStudyModel: ObservableObject {
     }
 
     func seekPlayback(toMilliseconds milliseconds: Int64) {
+        positionedListeningMark = nil
         stopSentenceLoop()
         if isListeningFirst {
             let autoplay = playerController.isPlaying || playerController.isStarting
@@ -940,13 +980,22 @@ final class VideoStudyModel: ObservableObject {
     }
 
     func analyzeCurrentSubtitle() {
+        selectCurrentSubtitle(analyze: true)
+    }
+
+    func translateCurrentSubtitle() {
+        guard showEnglishSubtitle else { return }
+        selectCurrentSubtitle(analyze: false)
+    }
+
+    private func selectCurrentSubtitle(analyze: Bool) {
         guard canAnalyzeCurrentSubtitle else { return }
         let frame = readingFrame
-        let cues = frame?.context.cues ?? activeEnglish
-        analyzeSubtitle(cues: cues, english: frame?.text ?? activeEnglishText,
-                        chinese: frame == nil ? activeChineseText : chineseText(for: cues),
-                        sourceContext: frame?.context ?? SubtitleSentenceContext.build(
-                            in: englishTimeline.allCues, selected: activeEnglish, boundaries: sentenceBoundaries))
+        let context = frame?.context ?? SubtitleSentenceContext.build(
+            in: englishTimeline.allCues, selected: activeEnglish, boundaries: sentenceBoundaries)
+        let cues = frame?.context.cues ?? (analyze ? activeEnglish : context?.cues ?? activeEnglish)
+        analyzeSubtitle(cues: cues, english: analyze ? frame?.text ?? activeEnglishText : context?.english ?? displayedEnglishText,
+                        chinese: chineseText(for: cues), sourceContext: context, analyze: analyze)
     }
 
     var hasAssistantWord: Bool {
@@ -954,22 +1003,9 @@ final class VideoStudyModel: ObservableObject {
         return draft.videoURL == currentSourceVideoURL && draft.englishTrackKey == activeTrackKeys[.english]
     }
 
-    var canAnalyzeAssistantSentence: Bool {
-        (usesWordSource && hasAssistantWord && selectedWordRequest?.sourceContext != nil) || canAnalyzeCurrentSubtitle
-    }
-
-    func analyzeAssistantSentence() {
-        if usesWordSource, hasAssistantWord, let source = selectedWordRequest?.sourceContext {
-            analyzeSubtitle(cues: source.cues, english: source.english,
-                            chinese: chineseText(for: source.cues), sourceContext: source)
-        } else {
-            analyzeCurrentSubtitle()
-        }
-    }
-
     private func analyzeSubtitle(cues: [SubtitleCue], english: String, chinese: String,
-                                 sourceContext: SubtitleSentenceContext?) {
-        pauseForLearning()
+                                 sourceContext: SubtitleSentenceContext?, analyze: Bool = true, keepWord: Bool = false) {
+        if !keepWord { pauseForLearning() }
         let context = englishTimeline.context(around: cues)
         let selection = SubtitleSelection(
             english: english,
@@ -985,11 +1021,32 @@ final class VideoStudyModel: ObservableObject {
             englishTrackKey: activeTrackKeys[.english]
         )
 
-        sidebarMode = .analysis
-        if showEnglishSubtitle { selectQuestionReference(for: sourceContext ?? SubtitleSentenceContext(cues: cues)) }
-        if selection == selectedSubtitle, analysisState == .loading, activeSentenceModelID == selectedModelID { return }
-        selectedSubtitle = selection
-        requestAnalysis(for: selection)
+        if !keepWord {
+            sidebarMode = .analysis
+            if showEnglishSubtitle { selectQuestionReference(for: sourceContext ?? SubtitleSentenceContext(cues: cues)) }
+        }
+        if selection != selectedSubtitle {
+            analysisTask?.cancel()
+            analysisRequestID = UUID()
+            analysisState = .idle
+            sentenceActivityDraft = nil
+            sentenceNoteState = .idle
+            confirmedSentenceHandle = nil
+            selectedSubtitle = selection
+        }
+        assistantGrammarExpanded = analyze
+        if analyze, analysisState != .loading || activeSentenceModelID != selectedModelID {
+            requestAnalysis(for: selection)
+        }
+    }
+
+    func toggleAssistantGrammar() {
+        guard let selection = selectedSubtitle else { return }
+        assistantGrammarExpanded.toggle()
+        if assistantGrammarExpanded, analysisState == .idle {
+            pauseForLearning()
+            requestAnalysis(for: selection)
+        }
     }
 
     var assistantPhraseRequest: StudyRequest? {
@@ -1031,12 +1088,17 @@ final class VideoStudyModel: ObservableObject {
     private var usesWordSource: Bool { sidebarMode == .word || sidebarMode == .phrase }
 
     var sidebarSource: (sentence: String, time: Int64)? {
-        let draft = usesWordSource ? wordActivityDraft : sentenceActivityDraft
-        guard let draft, draft.videoURL == currentSourceVideoURL,
-              draft.englishTrackKey == activeTrackKeys[.english] else { return nil }
-        let rawStart = draft.sourceContext?.cues.first?.startMilliseconds ?? draft.sourceStartMilliseconds
-        let time = rawStart.map { max(0, calibratedVideoTime($0, for: .english)) } ?? draft.startMilliseconds
-        return (draft.sourceContext?.english ?? draft.english, time)
+        if usesWordSource {
+            guard let draft = wordActivityDraft, hasAssistantWord else { return nil }
+            let rawStart = draft.sourceContext?.cues.first?.startMilliseconds ?? draft.sourceStartMilliseconds
+            let time = rawStart.map { max(0, calibratedVideoTime($0, for: .english)) } ?? draft.startMilliseconds
+            return (draft.sourceContext?.english ?? draft.english, time)
+        }
+        guard let selection = selectedSubtitle, selection.videoURL == currentSourceVideoURL,
+              selection.englishTrackKey == activeTrackKeys[.english] else { return nil }
+        let time = selection.rawStartMilliseconds.map { max(0, calibratedVideoTime($0, for: .english)) }
+            ?? selection.startMilliseconds
+        return (selection.english, time)
     }
 
     func questionReference(currentOnly: Bool) -> AssistantQuestionReference? {
@@ -1085,7 +1147,7 @@ final class VideoStudyModel: ObservableObject {
         let cues: [SubtitleCue]
     }
 
-    private var currentEnglishTrack: VideoTrack? {
+    var currentEnglishTrack: AssistantQuestionSource.VideoTrack? {
         if let url = englishExternalSubtitleURL { return .external(url) }
         return selectedEnglishEmbeddedTrackID.map(VideoTrack.embedded)
     }
@@ -1132,7 +1194,8 @@ final class VideoStudyModel: ObservableObject {
         updateActiveSubtitles(at: playerController.confirmedMilliseconds)
     }
 
-    func locateQuestionSource(_ reference: AssistantQuestionReference, excerpt: NSRange?) async throws {
+    func locateQuestionSource(_ reference: AssistantQuestionReference, excerpt: NSRange?, reviewMark: Bool? = nil,
+                              onReplayStarted: ((ListeningTarget, PlaybackSpeed) -> Void)? = nil) async throws {
         guard case let .video(url, anchors)? = reference.source?.location,
               VideoFile.isSupported(url), FileManager.default.isReadableFile(atPath: url.path) else {
             throw ReaderError.message("找不到这条问答的视频文件。")
@@ -1153,9 +1216,10 @@ final class VideoStudyModel: ObservableObject {
         guard originalLoad == mediaLoadID, originalURL == currentSourceVideoURL,
               originalTrack == englishSubtitleGeneration else { throw CancellationError() }
         let cues = prepared?.cues ?? englishCues
-        guard anchors.allSatisfy({ anchor in
-            cues.contains { $0.startMilliseconds == anchor.start && $0.text.utf8.elementsEqual(anchor.text.utf8) }
-        }) else { throw ReaderError.message("原字幕内容已改变，无法定位这条问答。") }
+        let sourceCues = anchors.compactMap { anchor in
+            cues.first { $0.startMilliseconds == anchor.start && $0.text.utf8.elementsEqual(anchor.text.utf8) }
+        }
+        guard sourceCues.count == anchors.count else { throw ReaderError.message("原字幕内容已改变，无法定位原句。") }
 
         if originalURL != url {
             let previousPosition = playerController.confirmedMilliseconds
@@ -1175,6 +1239,25 @@ final class VideoStudyModel: ObservableObject {
         } else if let prepared {
             useReferenceTrack(prepared)
             saveCurrentVideoState()
+        }
+        if let replay = reviewMark, let first = sourceCues.first {
+            let context = SubtitleSentenceContext(cues: sourceCues)
+            if replay {
+                guard let pass = ListeningPractice(context: context, timing: calibration.timing(for: .english),
+                                                   duration: playerController.durationMilliseconds) else {
+                    throw ReaderError.message("这段字幕已超出视频的可播放范围。")
+                }
+                playOnce(pass, onStarted: replayConfirmation(for: pass, onReplayStarted))
+            } else {
+                pauseForLearning()
+                seekPlayback(toMilliseconds: videoTime(for: first))
+                // VLC may hold a paused seek until playback resumes. Show the
+                // explicitly selected source line while its clock catches up.
+                positionedListeningMark = context
+            }
+            if isListeningFirst { revealStage = .english }
+            selectQuestionReference(for: context)
+            return
         }
         var offset = 0
         for cue in anchors {
@@ -1249,6 +1332,10 @@ final class VideoStudyModel: ObservableObject {
                 chineseTiming: calibration.timing(for: .chinese)
             )
         }
+        let sentenceCues = sourceContext?.cues ?? cues
+        analyzeSubtitle(cues: sentenceCues, english: sourceContext?.english ?? sentence,
+                        chinese: sourceContext == nil ? chinese : chineseText(for: sentenceCues),
+                        sourceContext: sourceContext, analyze: false, keepWord: true)
         if selectedWordRequest == request, wordLookupState == .loading, activeWordModelID == selectedModelID { return }
         if selectedWordRequest == request, cachedWordModelID == selectedModelID, case .loaded = wordLookupState {
             return
@@ -1454,9 +1541,7 @@ final class VideoStudyModel: ObservableObject {
                     }
                 }
                 if let referenceTrack { useReferenceTrack(referenceTrack) }
-                playerController.playbackRate = Float(
-                    min(2, max(0.5, learningRecord?.playbackRate ?? 1))
-                )
+                playerController.playbackRate = PlaybackSpeed(savedRate: Float(learningRecord?.playbackRate ?? 1)).rawValue
 
                 isPreparingMedia = false
                 mediaPreparationMessage = ""
@@ -1557,27 +1642,22 @@ final class VideoStudyModel: ObservableObject {
         authorizedObsidianDirectory
     }
 
-    var currentNoteState: NoteConfirmationState {
-        sidebarMode == .word ? wordNoteState : sentenceNoteState
-    }
-
-    var canConfirmCurrentNote: Bool {
+    func canConfirmNote(forWord: Bool) -> Bool {
         guard repository != nil, !obsidianDestinationPath.isEmpty else { return false }
-        switch currentNoteState {
+        switch forWord ? wordNoteState : sentenceNoteState {
         case .writing, .saved: return false
         case .idle, .pending: break
         }
-        if sidebarMode == .word, case .loaded = wordLookupState { return wordActivityDraft != nil }
-        if sidebarMode == .analysis, case .loaded = analysisState { return sentenceActivityDraft != nil }
+        if forWord, case .loaded = wordLookupState { return hasAssistantWord }
+        if !forWord, case .loaded = analysisState { return sentenceActivityDraft != nil }
         return false
     }
 
     /// This is the only path from a displayed answer to a learning record.
     /// Capture the answer/source before awaiting IO; playback/tab/query changes
     /// must never make the button save a different sentence or word.
-    func confirmCurrentNote() {
-        guard canConfirmCurrentNote, let repository else { return }
-        let isWord = sidebarMode == .word
+    func confirmNote(forWord isWord: Bool) {
+        guard canConfirmNote(forWord: isWord), let repository else { return }
         let queryID = isWord ? wordLookupID : analysisRequestID
         let draft = isWord ? wordActivityDraft : sentenceActivityDraft
         let modelID = isWord ? cachedWordModelID : cachedSentenceModelID
@@ -1772,6 +1852,12 @@ final class VideoStudyModel: ObservableObject {
     }
 
     private func handlePlaybackTime(_ milliseconds: Int64) {
+        if let started = replayStarted, let practice = listeningPractice, playerController.isPlaying,
+           playerController.pendingSeekMilliseconds == nil,
+           milliseconds > practice.startMilliseconds, milliseconds < practice.endMilliseconds {
+            replayStarted = nil
+            started(PlaybackSpeed(savedRate: playerController.playbackRate))
+        }
         if let practice = listeningPractice, sentenceLoop == nil,
            milliseconds >= practice.endMilliseconds {
             finishListeningPass(practice)

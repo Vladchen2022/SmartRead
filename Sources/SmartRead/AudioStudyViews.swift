@@ -11,89 +11,112 @@ struct AudioStudyInspector: View {
     let reader: ReaderModel
     let fontSize: Double
     @Binding var showsSubtitles: Bool
+    @Binding var clickWholeSentence: Bool
     let edit: (AudioStudyCue) -> Void
     let locateQuestionSource: (AssistantQuestionReference, NSRange?) async throws -> Void
-    @Environment(\.readerInterfaceScale) private var scale
 
     var body: some View {
-        ReaderInspector {
-            VStack(alignment: .leading, spacing: 11) {
-                ReaderInspectorHeading(title: "学习助手", symbol: "text.bubble")
-                AssistantActions(selected: assistant.action, available: availableActions, perform: perform)
-                HStack(spacing: 8) {
-                    Button { showsSubtitles.toggle() } label: {
-                        Label(showsSubtitles ? "隐藏字幕" : "显示字幕",
-                              systemImage: showsSubtitles ? "eye.slash" : "eye")
-                            .frame(maxWidth: .infinity)
+        AssistantInspector(reader: reader, mode: .audio, materialID: model.entry?.id.uuidString,
+                           locate: locateQuestionSource, manualSelection: showsSubtitles ? model.questionSelection : nil,
+                           visiblePassage: showsSubtitles ? assistant.selection?.sentence.text : nil,
+                           sentenceFavorite: sentenceFavorite, reference: questionReference) {
+            Button(showsSubtitles ? "隐藏字幕" : "显示字幕") { showsSubtitles.toggle() }
+                .disabled(model.cues.isEmpty)
+                .accessibilityIdentifier("audioShowSubtitles")
+            Toggle("点整句", isOn: $clickWholeSentence)
+            Button("修正当前句") { if let editableCue { edit(editableCue) } }
+                .disabled(!showsSubtitles || editableCue == nil)
+                .accessibilityIdentifier("editFocusedAudioCue")
+            if showsSubtitles, let target {
+                Button("翻译当前句") {
+                    if model.isPlaying { model.pause() }
+                    if let entry = model.entry,
+                       let sentence = AudioSubtitleSelection(entry: entry, cueID: target.cueID,
+                           target: target.word.map { SubtitleWord(text: $0.text, range: $0.range) }, wholeSentence: true) {
+                        model.selectQuestionReference(sentence)
+                        assistant.select(sentence, using: reader)
                     }
-                    .buttonStyle(ReaderButtonStyle(prominent: !showsSubtitles, compact: true))
-                    .disabled(model.cues.isEmpty)
-                    .accessibilityIdentifier("audioShowSubtitles")
-
-                    Button {
-                        if let editableCue { edit(editableCue) }
-                    } label: {
-                        Label("修正当前句", systemImage: "pencil")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(ReaderButtonStyle(prominent: false, compact: true))
-                    .disabled(!showsSubtitles || editableCue == nil)
-                    .accessibilityIdentifier("editFocusedAudioCue")
                 }
-                Text(model.cues.isEmpty ? "英文字幕由本机转写"
-                     : showsSubtitles ? "点词或拖选短语会暂停，点左侧时间播放原声" : "点左侧时间播放原声")
-                    .font(.system(size: max(11, 12 * scale)))
-                    .foregroundStyle(ReaderPalette.muted)
+                if assistant.selection?.word != nil {
+                    Button(StudyKind.phrase.label) { assistant.showPhrase(using: reader) }
+                }
+                Button("回到原文") { model.locateCue(target.cueID) }
+                    .accessibilityIdentifier("assistantReturnToSource")
+            }
+            if let translation = assistant.translation.result.completedText, showsSubtitles {
+                Button("复制译文") { copyAssistantResult(translation) }
             }
         } content: {
-            if showsSubtitles, let selection = assistant.selection, let action = assistant.action {
-                VStack(alignment: .leading, spacing: 12) {
-                    if let cue = model.cues.first(where: { $0.id == selection.cueID }) {
-                        AssistantSourceRow(sentence: selection.sentence.text, timestamp: audioTimeText(cue.start)) {
-                            model.locateCue(cue.id)
-                        }
-                        Divider()
-                    }
-                    if action == .word, let word = selection.word {
-                        Text(word.text)
-                            .font(.system(size: min(36, max(25, fontSize + 3)), design: .serif))
-                            .textSelection(.enabled)
-                    }
-                    AssistantResult(result: assistant.result, fontSize: max(17, min(32, fontSize * 0.8))) {
-                        perform(action)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
-            } else if let index = model.focusedCueIndex {
-                let cue = model.cues[index]
-                VStack(alignment: .leading, spacing: 9) {
-                    Text("第 \(index + 1) 句")
-                        .font(.system(size: 16, weight: .semibold))
-                    Text("\(audioTimeText(cue.start)) – \(audioTimeText(cue.end))")
-                        .font(.system(size: 14).monospacedDigit())
-                        .foregroundStyle(ReaderPalette.muted)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(15)
-                .background(ReaderPalette.card, in: RoundedRectangle(cornerRadius: 12))
-                .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(ReaderPalette.rule) }
-                .padding(16)
+            if showsSubtitles, let selection = assistant.selection {
+                results(selection)
+            } else {
+                Text(!showsSubtitles ? "字幕已隐藏。"
+                     : model.cues.isEmpty ? "导入音频后，英文字幕由本机转写。"
+                     : "点击字幕查看词义和整句翻译。")
+                    .font(.system(size: 13))
+                    .foregroundStyle(ReaderPalette.muted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(18)
             }
-        } footer: {
-            AssistantQuestionPanel(reader: reader, mode: .audio, materialID: model.entry?.id.uuidString,
-                                   locate: locateQuestionSource, manualSelection: showsSubtitles ? model.questionSelection : nil,
-                                   reference: questionReference)
         }
+    }
+
+    private var sentenceFavorite: AssistantSentenceFavoriteAction? {
+        guard showsSubtitles, let entry = model.entry, let selection = assistant.selection,
+              let cue = model.cues.first(where: { $0.id == selection.cueID }),
+              let reference = selection.questionReference(in: entry) else { return nil }
+        return .init(marks: reader.listeningMarks,
+                     target: .init(reference: reference, milliseconds: Int64((cue.start * 1000).rounded())))
+    }
+
+    private var resultFontSize: Double { max(15, min(28, fontSize * 0.72)) }
+
+    private func results(_ selection: AudioSubtitleSelection) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let word = selection.word {
+                AssistantSectionTitle(title: "词义")
+                Text(word.text).font(.system(size: 25, weight: .semibold, design: .serif)).textSelection(.enabled)
+                AssistantResult(result: assistant.word.result, fontSize: resultFontSize, cancel: assistant.word.cancel) {
+                    assistant.retryWord(using: reader)
+                }
+                Divider()
+            }
+            let cue = model.cues.first { $0.id == selection.cueID }
+            AssistantPassage(sentence: selection.sentence.text, focus: selection.word?.contextWordRange,
+                             timestamp: cue.map { audioTimeText($0.start) })
+            AssistantResult(result: assistant.translation.result, fontSize: resultFontSize,
+                            cancel: assistant.translation.cancel) { assistant.translate(using: reader) }
+            VStack(alignment: .leading, spacing: 0) {
+                Divider()
+                AssistantGrammarRow(isExpanded: assistant.grammarExpanded) { assistant.toggleGrammar(using: reader) }
+                if assistant.grammarExpanded {
+                    AssistantResult(result: assistant.grammar.result, fontSize: resultFontSize,
+                                    cancel: assistant.grammar.cancel) { assistant.analyze(using: reader) }
+                        .padding(.bottom, 12)
+                }
+                Divider()
+            }
+            if case .idle = assistant.phrase {
+                EmptyView()
+            } else {
+                HStack {
+                    AssistantSectionTitle(title: "搭配")
+                    Spacer()
+                    Button("收起", action: assistant.hidePhrase).buttonStyle(.link)
+                }
+                AssistantResult(result: assistant.phrase, fontSize: resultFontSize) { assistant.showPhrase(using: reader) }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
     }
 
     private func questionReference(currentOnly: Bool) -> AssistantQuestionReference? {
         guard showsSubtitles, let entry = model.entry else { return nil }
         let focused = model.focusedCueIndex.map { model.cues[$0] }
         let target = currentOnly ? assistant.selection.flatMap { $0.cueID == focused?.id ? $0 : nil } : assistant.selection
-        guard let reference = target ?? focused.flatMap({ AudioSubtitleSelection(entry: entry, cueID: $0.id) })
-        else { return nil }
-        return reference.questionReference(in: entry)
+        let reference = target ?? focused.flatMap { AudioSubtitleSelection(entry: entry, cueID: $0.id) }
+        return reference?.questionReference(in: entry)
     }
 
     private var editableCue: AudioStudyCue? {
@@ -102,35 +125,30 @@ struct AudioStudyInspector: View {
     }
 
     private var target: AudioSubtitleSelection? {
-        guard showsSubtitles, let entry = model.entry else { return nil }
+        guard let entry = model.entry else { return nil }
         return assistant.selection ?? editableCue.flatMap { AudioSubtitleSelection(entry: entry, cueID: $0.id) }
     }
-
-    private var availableActions: Set<AssistantAction> {
-        guard let target else { return [] }
-        return target.word == nil ? [.sentence] : [.word, .phrase, .sentence]
-    }
-
-    private func perform(_ action: AssistantAction) {
-        guard let target else { return }
-        if model.isPlaying { model.pause() }
-        assistant.show(action, for: target, using: reader)
-    }
-
 }
 
 struct AudioPlayerBar: View {
     let model: AudioStudyModel
+    var captureMark: (() -> (() -> Void)?)? = nil
+    var trackedReplay: (() -> Void)? = nil
     @State private var scrubPosition: Double?
     @Environment(\.readerInterfaceScale) private var scale
 
     var body: some View {
         let previous: (() -> Void)? = model.canMoveCue(by: -1) ? { model.moveCue(by: -1) } : nil
         let next: (() -> Void)? = model.canMoveCue(by: 1) ? { model.moveCue(by: 1) } : nil
-        let replay: (() -> Void)? = model.canReplay ? { model.replay() } : nil
+        let replay: (() -> Void)? = model.canReplay ? trackedReplay ?? { model.replay() } : nil
+        let speedMenu = PlaybackSpeedMenu(
+            selection: Binding(get: { model.playbackSpeed }, set: model.setPlaybackSpeed),
+            id: "audioPlaybackSpeed", help: "即时生效"
+        )
         return ReaderPlaybackBar(
             idPrefix: "audio", isPlaying: model.isPlaying, status: status,
-            previous: previous, toggle: { model.togglePlayback() }, next: next, replay: replay
+            previous: previous, toggle: { model.togglePlayback() }, next: next, replay: replay,
+            speedMenu: speedMenu, captureMark: captureMark
         ) {
             HStack(spacing: 12) {
                 Text(audioTimeText(scrubPosition ?? model.position))
@@ -156,10 +174,7 @@ struct AudioPlayerBar: View {
             .foregroundStyle(ReaderPalette.muted)
             .onChange(of: model.entry?.id) { scrubPosition = nil }
         } accessory: {
-            PlaybackSpeedMenu(
-                selection: model.playbackSpeed, onSelect: model.setPlaybackSpeed,
-                id: "audioPlaybackSpeed", help: "调整原声音频播放速度"
-            )
+            EmptyView()
         }
     }
 
@@ -270,6 +285,7 @@ struct AudioStudyContent: View {
     let maskOpacity: Double
     let highlightsSentence: Bool
     let selection: AudioSubtitleSelection?
+    var markedCues: Set<UUID> = []
     let lookUp: (UUID, SubtitleWord) -> Void
     let edit: (AudioStudyCue) -> Void
     @Environment(\.readerInterfaceScale) private var scale
@@ -408,6 +424,7 @@ struct AudioStudyContent: View {
                                           contentIdentity: cue.id.uuidString,
                                           alignment: .left, usesSerif: true,
                                           foreground: highlighted ? tone.ink : ReaderPalette.inkNS,
+                                          listeningMarks: markedCues.contains(cue.id) ? [NSRange(location: 0, length: cue.text.utf16.count)] : [],
                                           onSelectionBegan: { if model.isPlaying { model.pause() } }) { word, _ in
                         lookUp(cue.id, word)
                     }

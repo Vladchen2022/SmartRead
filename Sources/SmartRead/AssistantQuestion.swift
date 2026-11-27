@@ -1,12 +1,16 @@
 import Foundation
 import Observation
 
-struct AssistantQuestionReference: Codable, Equatable {
+struct AssistantQuestionReference: Codable, Equatable, Sendable {
     let passage: String
     var focus: String?
     var timestamp: String?
     var surrounding: SentenceContext?
     var source: AssistantQuestionSource?
+
+    var hasOriginalPassage: Bool {
+        !passage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var hasSurrounding: Bool {
         surrounding?.previousSentence != nil || surrounding?.nextSentence != nil

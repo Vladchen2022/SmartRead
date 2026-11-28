@@ -19,6 +19,7 @@ struct ImportSheet: View {
     @State private var address = ""
     @State private var problem: String?
     @State private var choosingFile = false
+    @State private var illustratedBook = false
     @State private var task: Task<Void, Never>?
     @FocusState private var field: Focus?
 
@@ -48,6 +49,10 @@ struct ImportSheet: View {
                 Label("整本导入，逐页阅读，并在历史记录里继续读。", systemImage: "book.closed")
                     .foregroundStyle(ReaderPalette.muted)
                     .padding(.vertical, 7)
+                Toggle("保留插图（图文阅读）", isOn: $illustratedBook)
+                    .toggleStyle(.checkbox)
+                    .accessibilityIdentifier("importPDFWithFigures")
+                    .help("启用阅读同步时，本书的 PDF 原件也会同步")
             }
 
             if let problem {
@@ -88,7 +93,7 @@ struct ImportSheet: View {
                     task?.cancel()
                     task = Task {
                         do {
-                            try await reader.importPDFBook(url)
+                            try await reader.importPDFBook(url, illustrated: illustratedBook)
                             if !Task.isCancelled { dismiss() }
                         } catch {
                             if !Task.isCancelled, !(error is CancellationError) { problem = error.localizedDescription }

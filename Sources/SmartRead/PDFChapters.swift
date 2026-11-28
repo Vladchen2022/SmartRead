@@ -6,16 +6,9 @@ struct PDFChapterHeading: Codable, Equatable, Sendable {
     let startPage: Int
 
     // The Bookworms files use "1 Chapter", "Chapter 1", and "1 Title".
-    private static let numbered = try! NSRegularExpression(
-        pattern: #"(?i)^\s*(?:chapter\s+([1-9][0-9]?)\b|([1-9][0-9]?)\s*[.．]?\s+\p{Script=Latin})"#
-    )
-
     static func read(_ line: String, on page: Int) -> Self? {
         let text = PDFBookText.normalizeLine(line)
-        guard text.count <= 110, PDFBookText.isEnglish(text),
-              let match = numbered.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return nil }
-        let numberRange = match.range(at: 1).location != NSNotFound ? match.range(at: 1) : match.range(at: 2)
-        guard let range = Range(numberRange, in: text), let number = Int(text[range]) else { return nil }
+        guard let number = PDFBookText.chapterNumber(in: text) else { return nil }
         return Self(number: number, text: text, startPage: page)
     }
 }

@@ -189,11 +189,12 @@ final class StudyTests: XCTestCase {
         let translation = InlineTranslation(sentence: NSRange(location: 0, length: 12), text: "例句。")
         let first = NSRange(location: 0, length: 12)
         let second = NSRange(location: 12, length: 7)
-        XCTAssertEqual(translation.displayedRange(for: first), first)
-        XCTAssertEqual(translation.originalRange(for: translation.displayedRange(for: second)), second)
-        XCTAssertNil(translation.originalCharacter(at: translation.closeRange.location))
+        let map = ReaderDisplayMap([(translation.insertion, translation.displayLength)])
+        XCTAssertEqual(map.displayedRange(for: first), first)
+        XCTAssertEqual(map.sourceRange(for: map.displayedRange(for: second)), second)
+        XCTAssertNil(map.sourceCharacter(at: translation.closeRange.location))
         let across = NSRange(location: 6, length: 12)
-        XCTAssertEqual(translation.originalRange(for: translation.displayedRange(for: across)), across)
-        XCTAssertEqual(translation.displayedSegments(for: across).map(\.length), [6, 6])
+        XCTAssertEqual(map.sourceRange(for: map.displayedRange(for: across)), across)
+        XCTAssertEqual(map.displayedSegments(for: across).map(\.length), [6, 6])
     }
 }

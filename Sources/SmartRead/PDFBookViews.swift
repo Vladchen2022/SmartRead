@@ -1,8 +1,16 @@
+import SmartReadSync
 import SwiftUI
 
-enum PDFBookPanel: String, Identifiable {
-    case original, chapters, translation
-    var id: String { rawValue }
+enum PDFBookPanel: Identifiable {
+    case original, chapters, translation, figure(Int)
+    var id: String {
+        switch self {
+        case .original: "original"
+        case .chapters: "chapters"
+        case .translation: "translation"
+        case .figure(let index): "figure-\(index)"
+        }
+    }
 }
 
 struct PDFBookNavigation: View {
@@ -82,33 +90,54 @@ struct PDFBookNavigation: View {
         .fixedSize()
     }
 
-    private var options: some View {
-        HStack(spacing: 6 * scale) {
-            Button {
-                change {
-                    if !(await reader.startPDFChapterReading()) { present(.chapters) }
-                }
-            } label: {
-                Label("按章阅读", systemImage: "book")
-            }
-            .buttonStyle(ReaderButtonStyle(prominent: true, compact: true))
-            .accessibilityIdentifier("pdfReadByChapter")
-
-            Button {
-                change { await reader.setPDFEnglishOnly(!location.englishOnly) }
-            } label: {
-                Label("只读英文", systemImage: location.englishOnly ? "checkmark.circle.fill" : "circle")
-            }
-            .buttonStyle(ReaderButtonStyle(prominent: location.englishOnly, compact: true))
-            .accessibilityIdentifier("pdfBookEnglishOnly")
-            .accessibilityValue(location.englishOnly ? "开启" : "关闭")
-            .help(location.englishOnly ? "点击显示所有页面和中文" : "点击只显示英文，翻页时跳过纯中文页")
-
-            Button { present(.original) } label: { Label("查看原页", systemImage: "doc.richtext") }
-                .buttonStyle(ReaderButtonStyle(prominent: false, compact: true))
-                .accessibilityIdentifier("pdfBookOriginal")
+    private var illustratedModeButton: some View {
+        Button {
+            change { await reader.setPDFIllustrated(location.illustrated == nil) }
+        } label: {
+            Label(location.illustrated == nil ? "图文阅读" : "纯文字", systemImage: "photo.on.rectangle")
         }
-        .fixedSize()
+        .buttonStyle(ReaderButtonStyle(prominent: false, compact: true))
+        .accessibilityIdentifier("togglePDFIllustrated")
+        .help("图文阅读保留原页插图，已连接 iCloud 时同步 PDF 原件")
+    }
+
+    private var options: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 6 * scale) { pageOptionButtons }
+                .fixedSize()
+            Menu { pageOptionButtons } label: {
+                Label("PDF 选项", systemImage: "ellipsis.circle")
+            }
+            .accessibilityIdentifier("pdfReadingOptions")
+        }
+    }
+
+    @ViewBuilder private var pageOptionButtons: some View {
+        Button {
+            change {
+                if !(await reader.startPDFChapterReading()) { present(.chapters) }
+            }
+        } label: {
+            Label("按章阅读", systemImage: "book")
+        }
+        .buttonStyle(ReaderButtonStyle(prominent: true, compact: true))
+        .accessibilityIdentifier("pdfReadByChapter")
+
+        Button {
+            change { await reader.setPDFEnglishOnly(!location.englishOnly) }
+        } label: {
+            Label("只读英文", systemImage: location.englishOnly ? "checkmark.circle.fill" : "circle")
+        }
+        .buttonStyle(ReaderButtonStyle(prominent: location.englishOnly, compact: true))
+        .accessibilityIdentifier("pdfBookEnglishOnly")
+        .accessibilityValue(location.englishOnly ? "开启" : "关闭")
+        .help(location.englishOnly ? "点击显示所有页面和中文" : location.illustrated == nil
+              ? "点击只显示英文，翻页时跳过纯中文页" : "点击只显示英文，翻页时保留含插图的页面")
+
+        Button { present(.original) } label: { Label("查看原页", systemImage: "doc.richtext") }
+            .buttonStyle(ReaderButtonStyle(prominent: false, compact: true))
+            .accessibilityIdentifier("pdfBookOriginal")
+        illustratedModeButton
     }
 
     private func chapterNavigation(_ reading: PDFChapterReading) -> some View {
@@ -173,6 +202,8 @@ struct PDFBookNavigation: View {
         }
         .buttonStyle(ReaderButtonStyle(prominent: false, compact: true))
         .accessibilityIdentifier("pdfReadByPage")
+
+        illustratedModeButton
     }
 
     private func goToPage() {
@@ -188,6 +219,64 @@ struct PDFBookNavigation: View {
     private func change(_ operation: @escaping @MainActor () async -> Void) {
         guard !reader.isLoadingPDF else { return }
         task = Task { await operation() }
+    }
+}
+
+struct PDFBookFigurePreview: View {
+    let reader: ReaderModel
+    let location: PDFBookLocation
+    let index: Int
+    let figure: ReadingPDFFigure
+    @Environment(\.dismiss) private var dismiss
+    @State private var image: CGImage?
+    @State private var issue: String?
+    @State private var zoom: CGFloat = 1
+    @State private var request = 0
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("PDF 第 \(location.index + 1) 页 · 插图 \(index + 1)").font(.headline)
+                Spacer()
+                Button("缩小", systemImage: "minus.magnifyingglass") { zoom = max(1, zoom / 1.4) }
+                    .labelStyle(.iconOnly).disabled(image == nil || zoom == 1)
+                Button("放大", systemImage: "plus.magnifyingglass") { zoom = min(5, zoom * 1.4) }
+                    .labelStyle(.iconOnly).disabled(image == nil || zoom == 5)
+                Button("适合窗口") { zoom = 1 }.disabled(zoom == 1)
+                Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            if let image {
+                GeometryReader { geometry in
+                    let fit = min(geometry.size.width / CGFloat(image.width), geometry.size.height / CGFloat(image.height))
+                    ScrollView([.horizontal, .vertical]) {
+                        Image(decorative: image, scale: 1)
+                            .resizable()
+                            .frame(width: CGFloat(image.width) * fit * zoom, height: CGFloat(image.height) * fit * zoom)
+                            .accessibilityLabel("PDF 插图")
+                            .accessibilityIdentifier("pdfEnlargedFigure")
+                            .frame(minWidth: geometry.size.width, minHeight: geometry.size.height)
+                    }
+                }
+            } else if let issue {
+                Text(issue).foregroundStyle(ReaderPalette.warning)
+                Button("重试") { request += 1 }
+                Spacer()
+            } else {
+                ProgressView("正在加载插图…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .padding(15)
+        .frame(minWidth: 530, idealWidth: 850, minHeight: 400, idealHeight: 650)
+        .background(ReaderPalette.panel)
+        .task(id: request) {
+            issue = nil
+            do {
+                let loaded = try await reader.pdfFigurePreview(location, figure: figure, longEdge: 3800)
+                if !Task.isCancelled { image = loaded }
+            } catch {
+                if !Task.isCancelled { issue = error.localizedDescription }
+            }
+        }
     }
 }
 

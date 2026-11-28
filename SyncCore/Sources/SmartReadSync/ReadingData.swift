@@ -25,21 +25,29 @@ public struct ReadingMaterial: Codable, Equatable, Identifiable, Sendable {
     public var chapter: String?
     public var chapterTranslation: String?
     public var chapterCatalog: [ReadingChapter]?
+    public var illustratedPDF: ReadingPDFPage?
     public var historyKey: String { bookID.map { "book/" + $0 } ?? "article/" + id }
     public var displayTitle: String { chapter.map { "\(title) · \($0)" } ?? title }
 
-    public init(title: String, body: String, legacyKey: String? = nil, sourceURL: URL? = nil) throws {
+    public init(title: String, body: String, legacyKey: String? = nil, sourceURL: URL? = nil,
+                illustratedPDF: ReadingPDFPage? = nil) throws {
         let title = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))
         self.title = title.isEmpty ? "粘贴的文章" : title
-        self.body = body.replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !self.body.isEmpty, self.body.utf16.count <= 250_000 else {
+        self.body = Self.normalizedBody(body)
+        guard !self.body.isEmpty || illustratedPDF != nil, self.body.utf16.count <= 250_000 else {
             throw ReadingSyncError.invalidText
         }
         self.sourceURL = sourceURL
+        self.illustratedPDF = illustratedPDF
         let source = sourceURL?.absoluteString ?? self.title
         self.legacyKey = legacyKey ?? Self.digest("\(source.utf8.count):\(source)\(self.body)")
         id = Self.digest(self.legacyKey + ":" + Self.digest(self.body))
+    }
+
+    public static func normalizedBody(_ text: String) -> String {
+        text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public static func digest(_ text: String) -> String {
@@ -170,13 +178,15 @@ public enum ReadingSyncValue: Codable, Equatable, Sendable {
 }
 
 public enum ReadingSyncError: LocalizedError {
-    case invalidText, unavailableFolder, unsupportedVersion, invalidSnapshot
+    case invalidText, unavailableFolder, unsupportedVersion, invalidSnapshot, invalidPDF, pdfPending
 
     public var errorDescription: String? {
         switch self {
         case .invalidText: return "正文需要在 1 到 25 万字符之间。"
         case .unavailableFolder: return "无法访问同步文件夹，请重新选择。"
         case .unsupportedVersion: return "同步文件由更新的 SmartRead 版本创建。"
+        case .invalidPDF: return "无法验证或读取 PDF 原件。"
+        case .pdfPending: return "PDF 原件尚未同步完成，请稍后重试。"
         case .invalidSnapshot: return "同步文件内容不完整，本地记录已保留。"
         }
     }

@@ -1,4 +1,5 @@
 import PDFKit
+import SmartReadSync
 import Vision
 
 struct PDFImportPart: Identifiable, Sendable {
@@ -156,7 +157,7 @@ actor PDFImportDocument {
                 embedded = page.string
             }
             if let embedded, embedded.rangeOfCharacter(from: .alphanumerics) != nil, !embedded.contains("\u{FFFD}") {
-                return (Self.reflow(embedded), false)
+                return (ReadingPDFLayout.reflow(embedded), false)
             }
         }
 
@@ -184,19 +185,7 @@ actor PDFImportDocument {
     func embeddedBookText(at index: Int) throws -> String? {
         try Task.checkCancellation()
         let page = try page(at: index)
-        guard let raw = page.string, raw.rangeOfCharacter(from: .alphanumerics) != nil,
-              !raw.contains("\u{FFFD}") else { return nil }
-        guard let selection = page.selection(for: page.bounds(for: .cropBox)) else { return Self.reflow(raw) }
-        let lines = selection.selectionsByLine().compactMap { line -> BookLine? in
-            guard let text = line.string else { return nil }
-            return BookLine(text: text, bounds: line.bounds(for: page))
-        }
-        // Scans can have a selectable page number or running header over a full-page image.
-        let bounds = page.bounds(for: .cropBox)
-        let interior = bounds.insetBy(dx: 0, dy: bounds.height * 0.10)
-        if !lines.contains(where: { $0.bounds.intersects(interior) && $0.text.contains(where: \.isLetter) }) { return nil }
-        let body = Self.bookBody(from: lines)
-        return body.isEmpty ? Self.reflow(raw) : body
+        return ReadingPDFLayout.embeddedText(page)
     }
 
     func bookChapterHeadings() throws -> [PDFChapterHeading] {
@@ -221,15 +210,19 @@ actor PDFImportDocument {
     }
 
     func recognizeBookPage(at index: Int, box: CGRect?) throws -> PDFBookPage {
-        let raster = try PDFPageRaster(page: page(at: index), longEdge: 3400)
-        let image = try raster.image(in: box)
-        let lines = try recognize(image, languages: ["zh-Hans", "en-US", "zh-Hant"]).compactMap { line -> BookLine? in
-            guard let text = line.topCandidates(1).first?.string else { return nil }
-            let rect = line.boundingBox
-            return BookLine(text: text, bounds: CGRect(x: rect.minX * CGFloat(image.width), y: rect.minY * CGFloat(image.height),
-                                                        width: rect.width * CGFloat(image.width), height: rect.height * CGFloat(image.height)))
-        }
-        return PDFBookPage(text: Self.bookBody(from: lines), usedOCR: true)
+        let text = try ReadingPDFLayout.recognizedText(page(at: index), box: box)
+        return PDFBookPage(text: text, usedOCR: true)
+    }
+
+    func illustratedBookPage(at index: Int, englishOnly: Bool, correction: PDFBookPage? = nil) throws -> PDFBookPage {
+        let result = try ReadingPDFLayout.illustratedPage(page(at: index), englishOnly: englishOnly, correction: correction?.text)
+        return PDFBookPage(text: result.text, usedOCR: result.usedOCR, figures: result.figures, normalizedText: result.normalizedText)
+    }
+
+    func renderedFigure(at index: Int, figure: ReadingPDFFigure, longEdge: CGFloat) throws -> CGImage {
+        try Task.checkCancellation()
+        let raster = try PDFPageRaster(page: page(at: index), longEdge: longEdge)
+        return try raster.image(in: figure.rect)
     }
 
     private func recognize(_ image: CGImage, languages: [String]) throws -> [VNRecognizedTextObservation] {
@@ -245,125 +238,19 @@ actor PDFImportDocument {
         return request.results ?? []
     }
 
-    private struct BookLine {
-        let text: String
-        let bounds: CGRect
-    }
-
-    private static func bookBody(from fragments: [BookLine]) -> String {
-        var groups: [[BookLine]] = []
-        for line in fragments.filter({ !$0.bounds.isEmpty && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
-            .sorted(by: { $0.bounds.midY > $1.bounds.midY }) {
-            if let first = groups.last?.first, abs(first.bounds.midY - line.bounds.midY) < min(first.bounds.height, line.bounds.height) * 0.45 {
-                groups[groups.count - 1].append(line)
-            } else {
-                groups.append([line])
-            }
-        }
-        let rows = groups.map { group -> BookLine in
-            let pieces = group.sorted { $0.bounds.minX < $1.bounds.minX }
-            var text = ""
-            for piece in pieces {
-                let part = piece.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !text.isEmpty, !PDFBookText.containsChinese(part) { text += " " }
-                text += part
-            }
-            let bounds = pieces.reduce(CGRect.null) { $0.union($1.bounds) }
-            return BookLine(text: PDFBookText.normalizeLine(text), bounds: bounds)
-        }
-        let left = rows.map(\.bounds.minX).min() ?? 0
-        var paragraphs: [String] = []
-        var previous: BookLine?
-        for row in rows where !row.text.isEmpty {
-            if let prior = previous, !paragraphs.isEmpty {
-                let gap = prior.bounds.midY - row.bounds.midY
-                let height = max(prior.bounds.height, row.bounds.height)
-                let languageChanged = PDFBookText.containsChinese(prior.text) != PDFBookText.containsChinese(row.text)
-                let indented = row.bounds.minX > left + max(10, height * 1.25)
-                let followsHeading = paragraphs.count == 1 && paragraphs[0] == prior.text
-                    && PDFChapterHeading.read(prior.text, on: 0) != nil
-                let startsParagraph = followsHeading || languageChanged || indented || gap > height * 1.75
-                if !startsParagraph {
-                    paragraphs[paragraphs.count - 1] += (PDFBookText.containsChinese(row.text) ? "" : " ") + row.text
-                } else {
-                    paragraphs.append(row.text)
-                }
-            } else {
-                paragraphs.append(row.text)
-            }
-            previous = row
-        }
-        return paragraphs.joined(separator: "\n\n")
-    }
-
     private func page(at index: Int) throws -> PDFPage {
         guard let page = document.page(at: index) else {
             throw ReaderError.message("找不到 PDF 第 \(index + 1) 页。")
         }
         return page
     }
-
-    private static func reflow(_ text: String) -> String {
-        let normalized = Article.normalizedBody(text)
-        var result = ""
-        var startsParagraph = false
-        for line in normalized.components(separatedBy: .newlines) {
-            let content = line.trimmingCharacters(in: .whitespaces)
-            if content.isEmpty {
-                startsParagraph = true
-            } else {
-                if !result.isEmpty { result += startsParagraph ? "\n\n" : " " }
-                result += content
-                startsParagraph = false
-            }
-        }
-        return result
-    }
 }
 
-private struct PDFPageRaster {
-    let page: CGPDFPage
-    let canvas: CGRect
-    let transform: CGAffineTransform
+private typealias PDFPageRaster = ReadingPDFPageRaster
 
+private extension ReadingPDFPageRaster {
     init(page: PDFPage, longEdge: CGFloat) throws {
-        guard let page = page.pageRef else { throw ReaderError.message("无法读取此页。") }
-        let crop = page.getBoxRect(.cropBox).intersection(page.getBoxRect(.mediaBox))
-        guard !crop.isEmpty, crop.width.isFinite, crop.height.isFinite else {
-            throw ReaderError.message("此页没有有效的页面尺寸。")
-        }
-        let rotated = page.rotationAngle % 180 != 0
-        let pageSize = CGSize(width: rotated ? crop.height : crop.width, height: rotated ? crop.width : crop.height)
-        let scale = longEdge / max(crop.width, crop.height)
-        canvas = CGRect(x: 0, y: 0,
-                        width: max(1, (scale * pageSize.width).rounded()),
-                        height: max(1, (scale * pageSize.height).rounded()))
-        self.page = page
-        let pageTransform = page.getDrawingTransform(.cropBox, rect: CGRect(origin: .zero, size: pageSize),
-                                                     rotate: 0, preserveAspectRatio: true)
-        transform = pageTransform.concatenating(CGAffineTransform(scaleX: canvas.width / pageSize.width,
-                                                                  y: canvas.height / pageSize.height))
-    }
-
-    func canvasRect(for box: CGRect) -> CGRect {
-        CGRect(x: box.minX * canvas.width, y: (1 - box.maxY) * canvas.height,
-               width: box.width * canvas.width, height: box.height * canvas.height)
-    }
-
-    func image(in box: CGRect? = nil) throws -> CGImage {
-        let slice = box.map { canvasRect(for: $0).integral.intersection(canvas) } ?? canvas
-        guard !slice.isEmpty,
-              let context = CGContext(data: nil, width: Int(slice.width), height: Int(slice.height),
-                                      bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
-            throw ReaderError.message("无法生成所选区域的图像。")
-        }
-        context.setFillColor(CGColor(gray: 1, alpha: 1))
-        context.fill(CGRect(origin: .zero, size: slice.size))
-        context.translateBy(x: -slice.minX, y: -slice.minY)
-        context.concatenate(transform)
-        context.drawPDFPage(page)
-        guard let image = context.makeImage() else { throw ReaderError.message("无法生成页面图像。") }
-        return image
+        guard let source = page.pageRef else { throw ReadingSyncError.invalidPDF }
+        try self.init(page: source, longEdge: longEdge)
     }
 }

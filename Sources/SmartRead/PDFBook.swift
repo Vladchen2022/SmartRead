@@ -1,6 +1,7 @@
 import CryptoKit
 import CoreGraphics
 import Foundation
+import SmartReadSync
 
 struct PDFBook: Codable, Equatable, Sendable {
     let id: String
@@ -15,6 +16,7 @@ struct PDFBookLocation: Codable, Equatable, Sendable {
     let usedOCR: Bool
     let sentenceEnding: String?
     var chapter: PDFChapterReading?
+    var illustrated: ReadingPDFPage? = nil
 
     var pageLabel: String { "第 \(index + 1)/\(book.pageCount) 页" }
 
@@ -27,36 +29,11 @@ struct PDFBookPage: Codable, Sendable {
     let text: String
     let usedOCR: Bool
     var boxes: [CGRect]? = nil
+    var figures: [ReadingPDFFigure]? = nil
+    var normalizedText: Bool? = nil
 }
 
-enum PDFBookText {
-    private static let han = try! NSRegularExpression(pattern: #"\p{Script=Han}"#)
-
-    static func containsChinese(_ text: String) -> Bool {
-        han.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
-    }
-
-    static func isEnglish(_ text: String) -> Bool {
-        !containsChinese(text) && WordLookup.pattern.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
-    }
-
-    static func englishOnly(_ text: String) -> String {
-        text.components(separatedBy: "\n\n").filter(isEnglish).joined(separator: "\n\n")
-    }
-
-    static func normalizeLine(_ text: String) -> String {
-        let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isEnglish(line) else { return line }
-        let spaced = line.replacingOccurrences(of: #"([．！？；：，])(?=[A-Za-z])"#, with: "$1 ", options: .regularExpression)
-        return (spaced.applyingTransform(.fullwidthToHalfwidth, reverse: false) ?? spaced)
-            .replacingOccurrences(of: #"\s+([,.!?;:])"#, with: "$1", options: .regularExpression)
-    }
-
-    static func hasSentenceEnding(_ text: String) -> Bool {
-        let sentence = text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: #""'’”)]」"#)))
-        return sentence.last.map { ".!?…。！？".contains($0) } ?? false
-    }
-}
+typealias PDFBookText = ReadingPDFText
 
 actor PDFBookStore {
     private let root: URL
@@ -91,18 +68,24 @@ actor PDFBookStore {
         return PDFBook(id: id, title: name.isEmpty ? sourceBook.name : name, pageCount: sourceBook.pageCount)
     }
 
-    func article(for book: PDFBook, at index: Int, step: Int = 0, englishOnly: Bool) async throws -> Article? {
+    func article(for book: PDFBook, at index: Int, step: Int = 0, englishOnly: Bool, illustrated: Bool = false) async throws -> Article? {
         guard (0..<book.pageCount).contains(index), [-1, 0, 1].contains(step) else { return nil }
         let document = try await document(for: book)
         var current = index
         while (0..<book.pageCount).contains(current) {
             try Task.checkCancellation()
-            let page = try await page(at: current, of: book, document: document)
-            let text = englishOnly ? PDFBookText.englishOnly(page.text) : page.text
-            if step == 0 || !englishOnly || !text.isEmpty {
-                let ending = await sentenceEnding(in: text, page: current, book: book, document: document)
+            let page = if illustrated {
+                try await illustratedPage(at: current, of: book, document: document, englishOnly: englishOnly)
+            } else {
+                try await page(at: current, of: book, document: document)
+            }
+            let text = englishOnly && !illustrated ? PDFBookText.englishOnly(page.text) : page.text
+            if step == 0 || !englishOnly || !text.isEmpty || page.figures?.isEmpty == false {
+                let ending = await sentenceEnding(in: text, page: current, book: book, document: document,
+                                                  illustrated: illustrated, englishOnly: englishOnly)
                 let location = PDFBookLocation(book: book, index: current, englishOnly: englishOnly,
-                                               usedOCR: page.usedOCR, sentenceEnding: ending)
+                    usedOCR: page.usedOCR, sentenceEnding: ending,
+                    illustrated: page.figures.map { ReadingPDFPage(pageCount: book.pageCount, figures: $0, normalizedText: page.normalizedText == true ? true : nil) })
                 return try Article(title: book.title, body: text, pdfPage: location)
             }
             current += step
@@ -112,6 +95,10 @@ actor PDFBookStore {
 
     func preview(_ location: PDFBookLocation, at index: Int?) async throws -> CGImage {
         try await document(for: location.book).preview(page: index ?? location.index)
+    }
+
+    func previewFigure(_ location: PDFBookLocation, figure: ReadingPDFFigure, longEdge: CGFloat) async throws -> CGImage {
+        try await document(for: location.book).renderedFigure(at: location.index, figure: figure, longEdge: longEdge)
     }
 
     func chapters(for book: PDFBook) async throws -> [PDFChapter] {
@@ -164,7 +151,15 @@ actor PDFBookStore {
         }
         let corrected = PDFBookPage(text: sections.joined(separator: "\n\n"), usedOCR: true, boxes: boxes)
         let article: Article
-        if let reading = location.chapter {
+        if location.illustrated != nil {
+            let next = try await document.illustratedBookPage(at: index, englishOnly: location.englishOnly, correction: corrected)
+            let ending = await sentenceEnding(in: next.text, page: index, book: book, document: document,
+                                              illustrated: true, englishOnly: location.englishOnly)
+            let updated = PDFBookLocation(book: book, index: index, englishOnly: location.englishOnly,
+                usedOCR: next.usedOCR, sentenceEnding: ending,
+                illustrated: ReadingPDFPage(pageCount: book.pageCount, figures: next.figures ?? [], normalizedText: next.normalizedText == true ? true : nil))
+            article = try Article(title: book.title, body: next.text, pdfPage: updated)
+        } else if let reading = location.chapter {
             article = try await chapterArticle(for: book, chapter: reading.chapter, englishOnly: location.englishOnly,
                                                join: reading.join, replacing: index, with: corrected)
         } else {
@@ -176,11 +171,15 @@ actor PDFBookStore {
         try Task.checkCancellation()
         let url = cacheURL(book, index)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        for onlyEnglish in [true, false] {
+            let key = illustratedURL(book, index, englishOnly: onlyEnglish)
+            if FileManager.default.fileExists(atPath: key.path) { try FileManager.default.removeItem(at: key) }
+        }
         try JSONEncoder().encode(corrected).write(to: url, options: .atomic)
         return article
     }
 
-    private func fileURL(_ id: String) -> URL { root.appending(path: "\(id).pdf") }
+    nonisolated func fileURL(_ id: String) -> URL { root.appending(path: "\(id).pdf") }
 
     private func document(for book: PDFBook) async throws -> PDFImportDocument {
         if let openDocument, openDocument.id == book.id { return openDocument.document }
@@ -203,12 +202,36 @@ actor PDFBookStore {
         return page
     }
 
-    private func sentenceEnding(in text: String, page: Int, book: PDFBook, document: PDFImportDocument) async -> String? {
+    private func illustratedURL(_ book: PDFBook, _ index: Int, englishOnly: Bool) -> URL {
+        cacheURL(book, index).deletingLastPathComponent()
+            .appendingPathComponent("illustrated-v1-\(englishOnly ? "en" : "all")-\(index).json")
+    }
+
+    private func illustratedPage(at index: Int, of book: PDFBook, document: PDFImportDocument, englishOnly: Bool) async throws -> PDFBookPage {
+        let url = illustratedURL(book, index, englishOnly: englishOnly)
+        if let data = try? Data(contentsOf: url), let cached = try? JSONDecoder().decode(PDFBookPage.self, from: data) {
+            return cached
+        }
+        let original = (try? Data(contentsOf: cacheURL(book, index))).flatMap { try? JSONDecoder().decode(PDFBookPage.self, from: $0) }
+        let corrected = original.flatMap { $0.boxes == nil ? nil : $0 }
+        let extracted = try await document.illustratedBookPage(at: index, englishOnly: englishOnly, correction: corrected)
+        try Task.checkCancellation()
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(extracted).write(to: url, options: .atomic)
+        return extracted
+    }
+
+    private func sentenceEnding(in text: String, page: Int, book: PDFBook, document: PDFImportDocument,
+                                illustrated: Bool = false, englishOnly: Bool = false) async -> String? {
         guard page + 1 < document.pageCount,
               let paragraph = text.components(separatedBy: "\n\n").last,
-              PDFBookText.isEnglish(paragraph), !PDFBookText.hasSentenceEnding(paragraph),
-              let next = try? await self.page(at: page + 1, of: book, document: document).text,
-              let opening = next.components(separatedBy: "\n\n").first, PDFBookText.isEnglish(opening),
+              PDFBookText.isEnglish(paragraph), !PDFBookText.hasSentenceEnding(paragraph) else { return nil }
+        let next = if illustrated {
+            try? await illustratedPage(at: page + 1, of: book, document: document, englishOnly: englishOnly).text
+        } else {
+            try? await self.page(at: page + 1, of: book, document: document).text
+        }
+        guard let next, let opening = next.components(separatedBy: "\n\n").first, PDFBookText.isEnglish(opening),
               let first = opening.first, first.isLowercase,
               let sentence = ReadingIndex(opening).articleSentences().first?.text,
               PDFBookText.hasSentenceEnding(sentence) else { return nil }

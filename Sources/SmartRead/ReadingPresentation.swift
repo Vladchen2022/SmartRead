@@ -12,37 +12,67 @@ struct InlineTranslation: Equatable {
         let close = "收起译文".utf16.count
         return NSRange(location: insertion + displayLength - close - 1, length: close)
     }
+}
 
-    func originalCharacter(at displayed: Int) -> Int? {
-        if displayed < insertion { return displayed }
-        if displayed < insertion + displayLength { return nil }
-        return displayed - displayLength
+/// Maps the text view's inserted translations and figures back to the stable source text.
+struct ReaderDisplayMap {
+    struct Insertion {
+        let sourceOffset: Int
+        let displayRange: NSRange
     }
 
-    func originalBoundary(at displayed: Int) -> Int {
-        originalCharacter(at: displayed) ?? insertion
+    let insertions: [Insertion]
+
+    init(_ lengths: [(offset: Int, length: Int)]) {
+        var added = 0
+        insertions = lengths.map { item in
+            let range = NSRange(location: item.offset + added, length: item.length)
+            added += item.length
+            return Insertion(sourceOffset: item.offset, displayRange: range)
+        }
     }
 
-    func originalRange(for displayed: NSRange) -> NSRange {
-        let start = originalBoundary(at: displayed.location)
-        let end = originalBoundary(at: NSMaxRange(displayed))
+    func sourceCharacter(at displayed: Int) -> Int? {
+        if insertions.contains(where: { NSLocationInRange(displayed, $0.displayRange) }) { return nil }
+        return sourceBoundary(at: displayed)
+    }
+
+    func sourceBoundary(at displayed: Int) -> Int {
+        var added = 0
+        for insertion in insertions {
+            if displayed < insertion.displayRange.location { break }
+            if NSLocationInRange(displayed, insertion.displayRange) { return insertion.sourceOffset }
+            added += insertion.displayRange.length
+        }
+        return displayed - added
+    }
+
+    func sourceRange(for displayed: NSRange) -> NSRange {
+        let start = sourceBoundary(at: displayed.location)
+        return NSRange(location: start, length: sourceBoundary(at: NSMaxRange(displayed)) - start)
+    }
+
+    func displayedRange(for source: NSRange) -> NSRange {
+        let start = displayedBoundary(source.location, after: true)
+        let end = displayedBoundary(NSMaxRange(source), after: source.length == 0)
         return NSRange(location: start, length: end - start)
     }
 
-    func displayedRange(for original: NSRange) -> NSRange {
-        let startsAfter = original.location >= insertion
-        let endsAfter = NSMaxRange(original) > insertion || (startsAfter && original.length == 0)
-        let start = original.location + (startsAfter ? displayLength : 0)
-        let end = NSMaxRange(original) + (endsAfter ? displayLength : 0)
-        return NSRange(location: start, length: end - start)
+    func displayedSegments(for source: NSRange) -> [NSRange] {
+        let limit = NSMaxRange(source)
+        var start = source.location
+        var result: [NSRange] = []
+        for insertion in insertions where insertion.sourceOffset > start && insertion.sourceOffset < limit {
+            result.append(displayedRange(for: NSRange(location: start, length: insertion.sourceOffset - start)))
+            start = insertion.sourceOffset
+        }
+        result.append(displayedRange(for: NSRange(location: start, length: limit - start)))
+        return result
     }
 
-    func displayedSegments(for original: NSRange) -> [NSRange] {
-        let end = NSMaxRange(original)
-        guard original.location < insertion, end > insertion else { return [displayedRange(for: original)] }
-        return [
-            NSRange(location: original.location, length: insertion - original.location),
-            NSRange(location: insertion + displayLength, length: end - insertion)
-        ]
+    private func displayedBoundary(_ source: Int, after: Bool) -> Int {
+        source + insertions.reduce(0) { length, item in
+            length + (item.sourceOffset < source || (after && item.sourceOffset == source) ? item.displayRange.length : 0)
+        }
     }
 }

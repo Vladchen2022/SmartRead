@@ -78,6 +78,7 @@ final class ReaderModel {
     private(set) var textSyncIssue: String?
     private var textSyncScanned = false
     private var textSyncRunning = false
+    private var publishedIllustratedPDFs: Set<String> = []
     private var applyingTextSync = false
     private var lastTextSyncRevision: Int?
     private var lastTextSyncMaterials: [String: (Article, ReadingMaterial)] = [:]
@@ -245,7 +246,7 @@ final class ReaderModel {
         try adopt(imported, refreshLearningSource: true, reimporting: true)
     }
 
-    func importPDFBook(_ url: URL) async throws {
+    func importPDFBook(_ url: URL, illustrated: Bool = false) async throws {
         guard !isLoadingPDF else { return }
         let version = articleVersion
         isLoadingPDF = true
@@ -255,10 +256,21 @@ final class ReaderModel {
         guard version == articleVersion else { throw CancellationError() }
         if let existing = ([library.current].compactMap { $0 } + history.map(\.article))
             .first(where: { $0.pdfPage?.book.id == book.id }) {
+            if illustrated, let location = existing.pdfPage, location.illustrated == nil {
+                let key = SavedReadingPosition.key(for: existing)
+                let position = savedPositions[key]?.chapterOffset ?? savedPositions[key]?.sentenceStart ?? 0
+                if let page = try await pdfBooks.article(for: book, at: location.sourcePage(at: position),
+                                                         englishOnly: location.englishOnly, illustrated: true) {
+                    try Task.checkCancellation()
+                    guard version == articleVersion else { throw CancellationError() }
+                    try adopt(page, reimporting: true)
+                    return
+                }
+            }
             try adopt(existing, reimporting: true)
             return
         }
-        guard let page = try await pdfBooks.article(for: book, at: 0, englishOnly: false) else { return }
+        guard let page = try await pdfBooks.article(for: book, at: 0, englishOnly: false, illustrated: illustrated) else { return }
         try Task.checkCancellation()
         guard version == articleVersion else { throw CancellationError() }
         try adopt(page, reimporting: true)
@@ -283,8 +295,28 @@ final class ReaderModel {
         await loadPDFPage(page, at: page.index, englishOnly: enabled)
     }
 
+    func setPDFIllustrated(_ enabled: Bool) async {
+        guard let page = article.pdfPage, let source = currentPDFSourcePage else { return }
+        await loadPDFPage(page, at: source, englishOnly: page.englishOnly, illustrated: enabled)
+    }
+
+    func pdfFigurePreview(_ location: PDFBookLocation, figure: ReadingPDFFigure, longEdge: CGFloat) async throws -> CGImage {
+        try await ensurePDFOriginal(location)
+        return try await pdfBooks.previewFigure(location, figure: figure, longEdge: longEdge)
+    }
+
+    private func ensurePDFOriginal(_ location: PDFBookLocation) async throws {
+        guard location.illustrated != nil else { return }
+        guard ReadingPDFPage.isValidBookID(location.book.id) else { throw ReadingSyncError.invalidPDF }
+        let destination = pdfBooks.fileURL(location.book.id)
+        if !FileManager.default.fileExists(atPath: destination.path) {
+            try await textSync.downloadPDFAsset(bookID: location.book.id, to: destination)
+        }
+    }
+
     func pdfPagePreview(_ location: PDFBookLocation, at index: Int? = nil) async throws -> CGImage {
-        try await pdfBooks.preview(location, at: index)
+        try await ensurePDFOriginal(location)
+        return try await pdfBooks.preview(location, at: index)
     }
 
     func pdfBoxes(_ book: PDFBook, at index: Int) async throws -> [CGRect] {
@@ -296,6 +328,7 @@ final class ReaderModel {
         isLoadingPDF = true
         defer { isLoadingPDF = false }
         let version = articleVersion
+        try await ensurePDFOriginal(location)
         let next = try await pdfBooks.correct(location, at: index, boxes: boxes)
         try Task.checkCancellation()
         guard version == articleVersion else { throw CancellationError() }
@@ -372,14 +405,17 @@ final class ReaderModel {
         }
     }
 
-    private func loadPDFPage(_ page: PDFBookLocation, at index: Int, step: Int = 0, englishOnly: Bool) async {
+    private func loadPDFPage(_ page: PDFBookLocation, at index: Int, step: Int = 0, englishOnly: Bool,
+                             illustrated requestedMode: Bool? = nil) async {
+        let illustrated = requestedMode ?? (page.illustrated != nil)
         guard !isLoadingPDF, (0..<page.book.pageCount).contains(index),
-              index != page.index || englishOnly != page.englishOnly || page.chapter != nil else { return }
+              index != page.index || englishOnly != page.englishOnly || page.chapter != nil || illustrated != (page.illustrated != nil) else { return }
         let version = articleVersion
         isLoadingPDF = true
         defer { isLoadingPDF = false }
         do {
-            let next = try await pdfBooks.article(for: page.book, at: index, step: step, englishOnly: englishOnly)
+            try await ensurePDFOriginal(page)
+            let next = try await pdfBooks.article(for: page.book, at: index, step: step, englishOnly: englishOnly, illustrated: illustrated)
             guard !Task.isCancelled, version == articleVersion else { return }
             guard let next else {
                 notice = step > 0 ? "后面没有可读的英文页。" : "前面没有可读的英文页。"
@@ -974,7 +1010,8 @@ final class ReaderModel {
                 target = try await pdfBooks.chapterArticle(for: pdf.book, chapter: chapter.chapter,
                                                           englishOnly: pdf.englishOnly, join: chapter.join)
             } else {
-                target = try await pdfBooks.article(for: pdf.book, at: pdf.index, englishOnly: pdf.englishOnly)
+                try await ensurePDFOriginal(pdf)
+                target = try await pdfBooks.article(for: pdf.book, at: pdf.index, englishOnly: pdf.englishOnly, illustrated: pdf.illustrated != nil)
             }
             try Task.checkCancellation()
             guard openingVersion == articleVersion else { throw CancellationError() }
@@ -1456,7 +1493,7 @@ final class ReaderModel {
                     try publishHistoryRemovals()
                     try textSync.setHistoryHidden(false, keys: [key])
                 }
-                try seedTextMaterial(next, lastRead: .now, includesStartingPosition: true)
+                try seedTextMaterial(next, lastRead: .now, includesStartingPosition: true, openedNow: true)
             } catch { textSyncIssue = error.localizedDescription }
             Task { await syncTextLibrary() }
         }
@@ -1599,6 +1636,7 @@ extension ReaderModel {
     func connectTextSync(to folder: URL) async {
         do {
             try textSync.connect(to: folder)
+            publishedIllustratedPDFs.removeAll()
             textSyncScanned = false
             await syncTextLibrary()
         } catch { textSyncIssue = error.localizedDescription }
@@ -1630,12 +1668,22 @@ extension ReaderModel {
                         do { try seedTextMaterial(record.pdfArticle(), record: record) }
                         catch { localIssue = error }
                     }
-                    if let chapters = try? await pdfBooks.chapters(for: book) {
+                    if !articles.contains(where: { $0.pdfPage?.book.id == book.id && $0.pdfPage?.illustrated != nil }),
+                       let chapters = try? await pdfBooks.chapters(for: book) {
                         try publishTextChapterCatalog(chapters, bookID: book.id)
                     }
                 } catch { localIssue = error }
             }
             textSyncScanned = localIssue == nil && recoveryNeeded.isEmpty
+        }
+        let illustratedBooks = Set(textSync.allMaterials.compactMap { $0.illustratedPDF == nil ? nil : $0.bookID })
+        for bookID in illustratedBooks.subtracting(publishedIllustratedPDFs) where ReadingPDFPage.isValidBookID(bookID) {
+            let file = pdfBooks.fileURL(bookID)
+            guard FileManager.default.fileExists(atPath: file.path) else { continue }
+            do {
+                try await textSync.publishPDFAsset(from: file, bookID: bookID)
+                publishedIllustratedPDFs.insert(bookID)
+            } catch { localIssue = error }
         }
         await textSync.sync(force: force)
         do {
@@ -1698,7 +1746,8 @@ extension ReaderModel {
            material.chapterCatalog == catalog {
             return material
         }
-        var material = try ReadingMaterial(title: article.title, body: article.body, legacyKey: key)
+        var material = try ReadingMaterial(title: article.title, body: article.body, legacyKey: key,
+                                           illustratedPDF: article.pdfPage?.illustrated)
         material.sourceURL = article.sourceURL
         let metadata = SyncedArticleMetadata(byline: article.byline, course: article.learningSource, pdf: article.pdfPage)
         if article.byline != nil || article.learningSource != nil || article.pdfPage != nil {
@@ -1715,16 +1764,27 @@ extension ReaderModel {
 
     private func decodedTextMaterial(_ material: ReadingMaterial) throws -> Article {
         let metadata = try material.desktopMetadata.map { try JSONDecoder().decode(SyncedArticleMetadata.self, from: $0) }
+        var pdf = metadata?.pdf
+        if let illustration = material.illustratedPDF, let bookID = material.bookID,
+           let page = material.page, (1...max(1, illustration.pageCount)).contains(page),
+           illustration.pageCount > 0, pdf?.chapter == nil {
+            if pdf == nil {
+                pdf = PDFBookLocation(book: PDFBook(id: bookID, title: material.title, pageCount: illustration.pageCount),
+                    index: page - 1, englishOnly: material.legacyKey.hasSuffix(":en"), usedOCR: false, sentenceEnding: nil)
+            }
+            pdf?.illustrated = illustration
+        }
         let item = try Article(title: material.title, body: material.body, sourceURL: material.sourceURL, byline: metadata?.byline,
-                               learningSource: metadata?.course, pdfPage: metadata?.pdf)
-        let id = try ReadingMaterial(title: item.title, body: item.body, legacyKey: SavedReadingPosition.key(for: item)).id
+                               learningSource: metadata?.course, pdfPage: pdf)
+        let id = try ReadingMaterial(title: item.title, body: item.body, legacyKey: SavedReadingPosition.key(for: item),
+                                     illustratedPDF: item.pdfPage?.illustrated).id
         guard material.id == id else { throw ReadingSyncError.invalidSnapshot }
         return item
     }
 
     private func seedTextMaterial(_ article: Article, record supplied: LearningRecord? = nil,
-                                  lastRead: Date = .distantPast, includesStartingPosition: Bool = false) throws {
-        guard !article.body.isEmpty else { return }
+                                  lastRead: Date = .distantPast, includesStartingPosition: Bool = false, openedNow: Bool = false) throws {
+        guard !article.body.isEmpty || article.pdfPage?.illustrated != nil else { return }
         let material = try textSyncMaterial(article)
         var values: [ReadingSyncValue] = [.material(material)]
         if let position = savedPositions[material.legacyKey],
@@ -1735,7 +1795,18 @@ extension ReaderModel {
         } else if includesStartingPosition {
             values.append(.progress(material: material.id, .init(offset: 0, completed: false, date: lastRead)))
         }
-        try textSync.record(values, seed: true)
+        if material.illustratedPDF != nil {
+            try textSync.record([.material(material)])
+            if openedNow {
+                let position = savedPositions[material.legacyKey]
+                try textSync.record([.progress(material: material.id, .init(offset: position?.sentenceStart ?? 0,
+                    chapterOffset: position?.chapterOffset, completed: position?.completed ?? false, date: lastRead))])
+            } else {
+                try textSync.record(Array(values.dropFirst()), seed: true)
+            }
+        } else {
+            try textSync.record(values, seed: true)
+        }
         values.removeAll(keepingCapacity: true)
 
         let record = try supplied ?? textLearningRecord(for: article)
@@ -1810,19 +1881,28 @@ extension ReaderModel {
         for material in materials {
             let item = try decodedTextMaterial(material)
             if let reading = textSync.progress(for: material.id),
-               reading.offset >= 0, reading.offset < item.body.utf16.count,
+               reading.offset >= 0,
+               reading.offset < item.body.utf16.count || (item.body.isEmpty && item.pdfPage?.illustrated != nil && reading.offset == 0),
                reading.chapterOffset.map({ $0 >= 0 && $0 < item.body.utf16.count }) ?? true,
                lastTextSyncMaterials[material.legacyKey].map({ $0.1.id == material.id }) ?? true,
                seenPositions.insert(material.legacyKey).inserted {
                 positions[material.legacyKey] = SavedReadingPosition(sentenceStart: reading.offset, completed: reading.completed,
                                                                     chapterOffset: reading.chapterOffset)
             }
-            if textSync.receivedMaterial(material.id),
-               nextLibrary.current?.matchesReadingItem(item) != true,
-               !nextLibrary.history.contains(where: { $0.article.matchesReadingItem(item) }) {
-                nextLibrary.history.insert(ArticleHistoryEntry(article: item,
-                    lastReadAt: textSync.progress(for: material.id)?.date ?? .now), at: 0)
-                libraryChanged = true
+            if textSync.receivedMaterial(material.id) || (material.illustratedPDF != nil && textSync.remoteProgress(for: material.id) != nil),
+               nextLibrary.current?.matchesReadingItem(item) != true {
+                let date = textSync.progress(for: material.id)?.date ?? .distantPast
+                if let existing = nextLibrary.history.firstIndex(where: { $0.article.matchesReadingItem(item) }) {
+                    let previous = nextLibrary.history[existing]
+                    if material.illustratedPDF != nil, previous.lastReadAt < date {
+                        nextLibrary.history[existing] = ArticleHistoryEntry(id: previous.id, article: item, lastReadAt: date)
+                        libraryChanged = true
+                    }
+                } else {
+                    nextLibrary.history.insert(ArticleHistoryEntry(article: item,
+                        lastReadAt: date == .distantPast ? .now : date), at: 0)
+                    libraryChanged = true
+                }
             }
             try listeningMarks.syncTextRows(textSync.marks(for: material.id), article: item, key: material.legacyKey)
             try applyTextFavorites(for: item, material: material.id)

@@ -104,7 +104,11 @@ private struct PDFImportEditor: View {
                     Text(document.name).lineLimit(1).foregroundStyle(ReaderPalette.muted)
                 }
                 Spacer()
-                Button("作为电子书打开", action: openAsBook)
+                Button("图文阅读") { openAsBook(illustrated: true) }
+                    .accessibilityIdentifier("openPDFIllustrated")
+                    .help("保留插图，使用现有 iCloud 同步时会同时共享 PDF 原件")
+                    .disabled(busy || reader.isLoadingPDF)
+                Button("作为电子书打开") { openAsBook(illustrated: false) }
                     .accessibilityIdentifier("openPDFAsBook")
                     .disabled(busy || reader.isLoadingPDF)
                 Button("返回", action: back).disabled(busy)
@@ -136,12 +140,12 @@ private struct PDFImportEditor: View {
         }
     }
 
-    private func openAsBook() {
+    private func openAsBook(illustrated: Bool) {
         issue = nil
         bookImport = Task {
             defer { bookImport = nil }
             do {
-                try await reader.importPDFBook(url)
+                try await reader.importPDFBook(url, illustrated: illustrated)
                 if !Task.isCancelled { imported() }
             } catch {
                 if !Task.isCancelled { issue = error.localizedDescription }

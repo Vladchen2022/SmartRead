@@ -1,5 +1,6 @@
 import Foundation
 import NaturalLanguage
+import SmartReadSync
 
 struct Article: Codable, Equatable, Sendable {
     let title: String
@@ -29,9 +30,7 @@ struct Article: Codable, Equatable, Sendable {
     }
 
     static func normalizedBody(_ text: String) -> String {
-        text.replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        ReadingMaterial.normalizedBody(text)
     }
 
     func matchesImport(_ other: Article) -> Bool {
@@ -253,6 +252,7 @@ struct SavedReadingPosition: Codable, Equatable {
         if let reading = page.chapter {
             return "pdf:\(page.book.id):chapter:\(reading.chapter.id):\(reading.join.rawValue)"
         }
-        return "pdf:\(page.book.id):\(page.index):\(page.englishOnly ? "en" : "all")"
+        return ReadingPDFPage.legacyKey(bookID: page.book.id, index: page.index, englishOnly: page.englishOnly,
+                                        normalized: page.illustrated?.normalizedText == true)
     }
 }

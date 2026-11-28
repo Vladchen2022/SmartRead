@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 
@@ -258,6 +259,27 @@ public final class ReadingSyncStore {
         #endif
         lastSync = nil
         if !localReadFailed { error = nil }
+    }
+
+    /// Publish the original once per content hash in the currently selected sync folder.
+    public func publishPDFAsset(from localFile: URL, bookID: String) async throws {
+        guard let folder else { throw ReadingSyncError.unavailableFolder }
+        let scoped = needsScopedAccess
+        try await Task.detached(priority: .utility) {
+            try FolderExchange.publishPDF(localFile, bookID: bookID, folder: folder, scoped: scoped)
+        }.value
+        guard self.folder == folder else { throw CancellationError() }
+    }
+
+    /// Copy the original to an app-owned cache and verify its SHA-256 before use.
+    /// Retry after iCloud makes the file available if this reports pdfPending.
+    public func downloadPDFAsset(bookID: String, to destination: URL) async throws {
+        guard let folder else { throw ReadingSyncError.unavailableFolder }
+        let scoped = needsScopedAccess
+        try await Task.detached(priority: .userInitiated) {
+            try FolderExchange.downloadPDF(bookID, to: destination, folder: folder, scoped: scoped)
+        }.value
+        guard self.folder == folder else { throw CancellationError() }
     }
 
     public var materials: [ReadingMaterial] {
@@ -594,6 +616,72 @@ private struct FolderExchange {
                 try data.write(to: destination, options: .atomic)
             }
         }
+    }
+
+    private static func pdfAssetURL(_ bookID: String, in root: URL) throws -> URL {
+        guard ReadingPDFPage.isValidBookID(bookID) else {
+            throw ReadingSyncError.invalidPDF
+        }
+        return root.appendingPathComponent("PDFAssets", isDirectory: true).appendingPathComponent(bookID + ".pdf")
+    }
+
+    private static func isPDFPlaceholder(_ url: URL) -> Bool {
+        let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+        return FileManager.default.fileExists(atPath: placeholder.path)
+            || (try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]).ubiquitousItemDownloadingStatus) == .notDownloaded
+    }
+
+    static func publishPDF(_ source: URL, bookID: String, folder: URL, scoped: Bool) throws {
+        try open(folder, scoped: scoped) { root in
+            let url = try pdfAssetURL(bookID, in: root)
+            let files = FileManager.default
+            if isPDFPlaceholder(url) || files.fileExists(atPath: url.path) { return }
+            try files.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try coordinate(url, writing: true) { destination in
+                if !isPDFPlaceholder(destination) && !files.fileExists(atPath: destination.path) {
+                    try copyVerifiedPDF(from: source, to: destination, bookID: bookID)
+                }
+            }
+        }
+    }
+
+    static func downloadPDF(_ bookID: String, to destination: URL, folder: URL, scoped: Bool) throws {
+        if FileManager.default.fileExists(atPath: destination.path) {
+            guard try pdfHash(destination) == bookID else { throw ReadingSyncError.invalidPDF }
+            return
+        }
+        try open(folder, scoped: scoped) { root in
+            let url = try pdfAssetURL(bookID, in: root)
+            let files = FileManager.default
+            guard !isPDFPlaceholder(url), files.fileExists(atPath: url.path) else {
+                try? files.startDownloadingUbiquitousItem(at: url)
+                throw ReadingSyncError.pdfPending
+            }
+            try files.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try coordinate(url, writing: false) { source in
+                try copyVerifiedPDF(from: source, to: destination, bookID: bookID)
+            }
+        }
+    }
+
+    private static func copyVerifiedPDF(from source: URL, to destination: URL, bookID: String) throws {
+        let files = FileManager.default
+        let staged = destination.deletingLastPathComponent().appendingPathComponent("." + UUID().uuidString + ".partial")
+        defer { try? files.removeItem(at: staged) }
+        try files.copyItem(at: source, to: staged)
+        guard try pdfHash(staged) == bookID else { throw ReadingSyncError.invalidPDF }
+        do { try files.moveItem(at: staged, to: destination) }
+        catch let error as CocoaError where error.code == .fileWriteFileExists {
+            guard try pdfHash(destination) == bookID else { throw ReadingSyncError.invalidPDF }
+        }
+    }
+
+    private static func pdfHash(_ url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hash = SHA256()
+        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty { hash.update(data: chunk) }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private static func coordinate<T>(_ url: URL, writing: Bool, _ action: @escaping (URL) throws -> T) throws -> T {

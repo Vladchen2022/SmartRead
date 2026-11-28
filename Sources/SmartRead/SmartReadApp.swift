@@ -1,3 +1,4 @@
+import SmartReadSync
 import SwiftUI
 
 enum ReaderMode: String, CaseIterable, Codable, Sendable {
@@ -261,6 +262,7 @@ struct ReaderWindow: View {
     @State private var editingCue: AudioStudyCue?
     @State private var pendingPDF: URL?
     @State private var pdfBookPanel: PDFBookPanel?
+    @State private var pdfThumbnails: (version: UUID, values: [Int: CGImage])?
     @State private var dropTarget = false
     @State private var subtitleAssistant = AudioSubtitleAssistant()
     @State private var pendingMarkedSpeech: (version: UUID, sentence: TextExcerpt)?
@@ -399,6 +401,10 @@ struct ReaderWindow: View {
                     PDFChapterBrowser(reader: reader, location: page)
                 case .translation:
                     if let chapter = page.chapter { PDFChapterTranslation(reading: chapter) }
+                case .figure(let index):
+                    if let figures = page.illustrated?.figures, figures.indices.contains(index) {
+                        PDFBookFigurePreview(reader: reader, location: page, index: index, figure: figures[index])
+                    }
                 }
             }
         }
@@ -786,11 +792,17 @@ struct ReaderWindow: View {
     }
 
     private func articleColumn(_ article: Article, version: UUID, contentWidth: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let page = article.pdfPage
+        let thumbnails = pdfThumbnails?.version == version ? pdfThumbnails?.values ?? [:] : [:]
+        let figures = (page?.illustrated?.figures ?? []).enumerated().compactMap { index, figure in
+            figure.hasValidRect ? ReaderFigure(index: index, placement: figure, image: thumbnails[index]) : nil
+        }
+        return VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 13) {
                 HStack(spacing: 8) {
                     if let page = article.pdfPage {
-                        Label(page.usedOCR ? "PDF 电子书 · 本机 OCR" : "PDF 电子书", systemImage: "book.closed")
+                        Label(page.illustrated != nil ? "PDF 图文阅读" : page.usedOCR ? "PDF 电子书 · 本机 OCR" : "PDF 电子书",
+                              systemImage: "book.closed")
                         if page.chapter != nil, let source = reader.currentPDFSourcePage {
                             Text("PDF 第 \(source + 1) 页")
                                 .accessibilityIdentifier("pdfChapterSourcePage")
@@ -857,7 +869,7 @@ struct ReaderWindow: View {
             .padding(.top, 31)
             .padding(.horizontal, 4)
 
-            if article.body.isEmpty, let page = article.pdfPage {
+            if article.body.isEmpty, figures.isEmpty, let page {
                 ContentUnavailableView(
                     page.englishOnly ? "本页没有英文正文" : "本页没有识别出文字",
                     systemImage: "doc.text",
@@ -872,6 +884,8 @@ struct ReaderWindow: View {
                     marks: reader.marks,
                     listeningMarks: mode == .text ? reader.textListeningMarks : [],
                     inlineTranslation: reader.inlineTranslation,
+                    figures: figures,
+                    onOpenFigure: { pdfBookPanel = .figure($0) },
                     jump: reader.jump,
                     listeningFocus: speech.focusRequest.map { request in
                         ListeningFocus(request: request, paragraph: reader.listeningParagraph(for: request.range))
@@ -928,6 +942,24 @@ struct ReaderWindow: View {
         .frame(width: contentWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(ReaderPalette.paper)
+        .task(id: version) {
+            guard let page, !figures.isEmpty else { return }
+            for attempt in 0..<5 {
+                do {
+                    var images: [Int: CGImage] = [:]
+                    for figure in figures {
+                        try Task.checkCancellation()
+                        images[figure.index] = try await reader.pdfFigurePreview(page, figure: figure.placement, longEdge: 1100)
+                    }
+                    guard !Task.isCancelled else { return }
+                    pdfThumbnails = (version, images)
+                    return
+                } catch ReadingSyncError.pdfPending where attempt < 4 {
+                    try? await Task.sleep(for: .seconds(2))
+                    if Task.isCancelled { return }
+                } catch { return }
+            }
+        }
     }
 
     private var articleRecordButtons: some View {

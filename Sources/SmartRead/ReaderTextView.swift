@@ -1,9 +1,16 @@
 import AppKit
+import SmartReadSync
 import SwiftUI
 
 struct ListeningFocus: Equatable {
     let request: ReaderSpeech.FocusRequest
     let paragraph: NSRange
+}
+
+struct ReaderFigure: Equatable {
+    let index: Int
+    let placement: ReadingPDFFigure
+    let image: CGImage?
 }
 
 struct ReaderTextView: NSViewRepresentable {
@@ -13,6 +20,8 @@ struct ReaderTextView: NSViewRepresentable {
     let marks: [ReaderMark]
     let listeningMarks: [TextListeningMark]
     let inlineTranslation: InlineTranslation?
+    var figures: [ReaderFigure] = []
+    var onOpenFigure: (Int) -> Void = { _ in }
     let jump: ReadingJump?
     let listeningFocus: ListeningFocus?
     let maskOpacity: Double
@@ -103,6 +112,7 @@ struct ReaderTextView: NSViewRepresentable {
         surface.onWordStudy = { [weak coordinator = context.coordinator] kind, excerpt in
             coordinator?.parent.onWordStudy(kind, excerpt)
         }
+        view.onOpenFigure = { [weak coordinator = context.coordinator] in coordinator?.parent.onOpenFigure($0) }
         context.coordinator.surface = surface
         return surface
     }
@@ -123,7 +133,9 @@ struct ReaderTextView: NSViewRepresentable {
         let newArticle = coordinator.version != version
         let newFont = coordinator.fontSize != fontSize
         let newInline = view.inlineTranslation != inlineTranslation
-        let reflow = newArticle || newFont || newInline
+        let newFigures = coordinator.figures != figures ||
+            (!figures.isEmpty && coordinator.figureScale != interfaceScale)
+        let reflow = newArticle || newFont || newInline || newFigures
         if reflow {
             surface.resetResizeAnchor()
             let selection = view.originalSelectionRange
@@ -141,6 +153,10 @@ struct ReaderTextView: NSViewRepresentable {
             view.originalText = bodyText
             view.inlineTranslation = inlineTranslation
             let content = NSMutableAttributedString(string: bodyText, attributes: attributes)
+            var blocks: [(offset: Int, content: NSAttributedString, index: Int?)] = []
+            view.translationCloseRange = nil
+            view.translationDisplayRange = nil
+            view.figureDisplayIndices = [:]
             if let inlineTranslation {
                 let tone = ReaderPalette.highlight(.referent)
                 let translated = NSMutableAttributedString(string: inlineTranslation.displayText, attributes: [
@@ -154,7 +170,50 @@ struct ReaderTextView: NSViewRepresentable {
                                     length: inlineTranslation.closeRange.length)
                 translated.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: close)
                 translated.addAttribute(.toolTip, value: "点击收起这条译文", range: close)
-                content.insert(translated, at: inlineTranslation.insertion)
+                blocks.append((inlineTranslation.insertion, translated, nil))
+            }
+            let source = bodyText as NSString
+            for figure in figures {
+                let offset = figure.placement.offset
+                guard offset >= 0, offset <= source.length, Range(NSRange(location: offset, length: 0), in: bodyText) != nil else { continue }
+                let block = NSMutableAttributedString(string: offset == source.length && offset != 0 ? "\n\n" : "",
+                                                      attributes: attributes)
+                let attachmentIndex = block.length
+                let attachment = NSTextAttachment()
+                if let image = figure.image {
+                    let size = NSSize(width: image.width, height: image.height)
+                    attachment.attachmentCell = ReaderFigureCell(imageCell: NSImage(cgImage: image, size: size))
+                } else {
+                    attachment.attachmentCell = ReaderFigureCell(imageCell: NSImage(systemSymbolName: "photo", accessibilityDescription: nil))
+                }
+                block.append(NSAttributedString(attachment: attachment))
+                let caption = figure.placement.inPageGallery ? "本页插图 \(figure.index + 1)" : "插图 \(figure.index + 1)"
+                block.append(NSAttributedString(string: "\n" + caption + "\n\n", attributes: [
+                    .font: NSFont.systemFont(ofSize: 13 * interfaceScale),
+                    .foregroundColor: ReaderPalette.inkNS,
+                    .paragraphStyle: style
+                ]))
+                let captionRange = NSRange(location: attachmentIndex + 2, length: caption.utf16.count)
+                block.addAttribute(.link, value: NSNumber(value: figure.index), range: captionRange)
+                block.addAttribute(.toolTip, value: "点击放大 · " + caption, range: NSRange(location: attachmentIndex, length: 1))
+                blocks.append((offset, block, figure.index))
+            }
+            blocks = blocks.enumerated().sorted {
+                ($0.element.offset, $0.offset) < ($1.element.offset, $1.offset)
+            }.map(\.element)
+            view.displayMap = ReaderDisplayMap(blocks.map { ($0.offset, $0.content.length) })
+            for (block, insertion) in zip(blocks, view.displayMap.insertions) {
+                content.insert(block.content, at: insertion.displayRange.location)
+                if let index = block.index {
+                    block.content.enumerateAttribute(.attachment, in: NSRange(location: 0, length: block.content.length)) { value, range, _ in
+                        if value != nil { view.figureDisplayIndices[insertion.displayRange.location + range.location] = index }
+                    }
+                } else if let inlineTranslation {
+                    view.translationDisplayRange = insertion.displayRange
+                    let close = inlineTranslation.closeRange
+                    view.translationCloseRange = NSRange(location: insertion.displayRange.location + close.location - inlineTranslation.insertion,
+                                                         length: close.length)
+                }
             }
             storage.setAttributedString(content)
             if newArticle {
@@ -170,6 +229,8 @@ struct ReaderTextView: NSViewRepresentable {
             }
             coordinator.version = version
             coordinator.fontSize = fontSize
+            coordinator.figures = figures
+            coordinator.figureScale = interfaceScale
             surface.needsLayout = true
         }
 
@@ -193,8 +254,8 @@ struct ReaderTextView: NSViewRepresentable {
             }
             if jump.alignToTop {
                 surface.pendingResumeCharacter = jump.range.location
-            } else if jump.showInline, let translation = inlineTranslation {
-                view.scrollRangeToVisible(NSRange(location: translation.insertion, length: translation.displayLength))
+            } else if jump.showInline, let range = view.translationDisplayRange {
+                view.scrollRangeToVisible(range)
             } else {
                 view.scrollRangeToVisible(displayed)
             }
@@ -209,10 +270,20 @@ struct ReaderTextView: NSViewRepresentable {
         fileprivate weak var surface: ReadingSurface?
         var version: UUID?
         var fontSize: Double?
+        var figures: [ReaderFigure] = []
+        var figureScale: CGFloat?
         var marks: [ReaderMark] = []
         var jumpID: UUID?
 
         init(parent: ReaderTextView) { self.parent = parent }
+
+        func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+            guard let index = link as? NSNumber, parent.figures.contains(where: { $0.index == index.intValue }) else {
+                return false
+            }
+            parent.onOpenFigure(index.intValue)
+            return true
+        }
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard surface?.isUpdatingText != true, let view = notification.object as? ClickableTextView else { return }
@@ -640,6 +711,20 @@ private final class ListeningShadeView: NSView {
     }
 }
 
+private final class ReaderFigureCell: NSTextAttachmentCell {
+    override func cellFrame(for textContainer: NSTextContainer, proposedLineFragment lineFrag: NSRect,
+                            glyphPosition position: NSPoint, characterIndex charIndex: Int) -> NSRect {
+        let original = cellSize()
+        let width = max(1, min(440, lineFrag.width - 2 * textContainer.lineFragmentPadding))
+        let scale = min(1, width / max(1, original.width), 280 / max(1, original.height))
+        return NSRect(x: 0, y: 0, width: original.width * scale, height: original.height * scale)
+    }
+
+    override func draw(withFrame cellFrame: NSRect, in controlView: NSView?, characterIndex: Int, layoutManager: NSLayoutManager) {
+        image?.draw(in: cellFrame, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+}
+
 private final class ClickableTextView: NSTextView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -649,6 +734,12 @@ private final class ClickableTextView: NSTextView {
 
     var originalText = ""
     var inlineTranslation: InlineTranslation?
+    var displayMap = ReaderDisplayMap([])
+    var translationCloseRange: NSRange?
+    var translationDisplayRange: NSRange?
+    var figureDisplayIndices: [Int: Int] = [:]
+    var onOpenFigure: ((Int) -> Void)?
+
     var onTextClick: ((Int) -> Void)?
     var onUserSelection: ((TextExcerpt) -> Void)?
     var onUserPhraseSelection: ((TextExcerpt) -> Void)?
@@ -663,10 +754,15 @@ private final class ClickableTextView: NSTextView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if event.clickCount == 1, let inlineTranslation, let index = textIndex(at: point),
-           NSLocationInRange(index, inlineTranslation.closeRange) {
-            onCloseInline?()
-            return
+        if event.clickCount == 1, let index = textIndex(at: point) {
+            if let close = translationCloseRange, NSLocationInRange(index, close) {
+                onCloseInline?()
+                return
+            }
+            if let figure = figureDisplayIndices[index] {
+                onOpenFigure?(figure)
+                return
+            }
         }
         onSelectionBegan?()
         super.mouseDown(with: event)
@@ -688,8 +784,7 @@ private final class ClickableTextView: NSTextView {
         guard event.clickCount == 1,
               event.modifierFlags.intersection([.shift, .option, .command, .control]).isEmpty,
               let index = textIndex(at: point) else { return }
-        let original = inlineTranslation == nil ? index : inlineTranslation?.originalCharacter(at: index)
-        if let original { onTextClick?(original) }
+        if let original = displayMap.sourceCharacter(at: index) { onTextClick?(original) }
     }
 
     private func textIndex(at point: NSPoint) -> Int? {
@@ -705,11 +800,20 @@ private final class ClickableTextView: NSTextView {
     }
 
     var originalSelectionRange: NSRange {
-        inlineTranslation?.originalRange(for: selectedRange()) ?? selectedRange()
+        displayMap.sourceRange(for: selectedRange())
     }
 
     func displayedRange(for range: NSRange) -> NSRange {
-        inlineTranslation?.displayedRange(for: range) ?? range
+        displayMap.displayedRange(for: range)
+    }
+
+    override func copy(_ sender: Any?) {
+        guard !figureDisplayIndices.isEmpty else { super.copy(sender); return }
+        let range = originalSelectionRange
+        guard range.length > 0, NSMaxRange(range) <= originalText.utf16.count else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString((originalText as NSString).substring(with: range), forType: .string)
     }
 
     func selectionExcerpt() -> TextExcerpt? {
@@ -755,7 +859,7 @@ private final class ClickableTextView: NSTextView {
         guard let layoutManager = layoutManager as? ReaderLayoutManager else { return }
         layoutManager.spokenSegments = []
         for mark in previous {
-            for range in inlineTranslation?.displayedSegments(for: mark.range) ?? [mark.range] {
+            for range in displayMap.displayedSegments(for: mark.range) {
                 if mark.style == .listening {
                     layoutManager.removeTemporaryAttribute(.underlineStyle, forCharacterRange: range)
                     layoutManager.removeTemporaryAttribute(.underlineColor, forCharacterRange: range)
@@ -767,7 +871,7 @@ private final class ClickableTextView: NSTextView {
         }
         for mark in current {
             let tone = ReaderPalette.highlight(mark.style)
-            for range in inlineTranslation?.displayedSegments(for: mark.range) ?? [mark.range] {
+            for range in displayMap.displayedSegments(for: mark.range) {
                 if mark.style == .spoken {
                     layoutManager.spokenSegments.append(range)
                     layoutManager.addTemporaryAttribute(.foregroundColor, value: tone.ink, forCharacterRange: range)
@@ -804,7 +908,7 @@ private final class ClickableTextView: NSTextView {
         guard glyph < layoutManager.numberOfGlyphs else { return nil }
         let line = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
         let index = layoutManager.characterIndexForGlyph(at: glyph)
-        let original = inlineTranslation?.originalBoundary(at: index) ?? index
+        let original = displayMap.sourceBoundary(at: index)
         return ScrollAnchor(character: original, lineOffset: localY - line.minY)
     }
 

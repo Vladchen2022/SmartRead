@@ -1,4 +1,5 @@
 import Observation
+import SmartReadSync
 import SwiftUI
 
 struct ListeningTarget {
@@ -32,12 +33,17 @@ struct ListeningMark: Codable, Identifiable {
     var replayCount: Int?
     var slowReplayCount: Int?
     var reviewedReplayCount: Int?
+    var reviewedSlowCount: Int?
     var isSaved: Bool?
 
     var isMarked: Bool { manuallyMarked ?? true }
     var replays: Int { replayCount ?? 0 }
     var slowReplays: Int { slowReplayCount ?? 0 }
-    var isSuggested: Bool { replays - (reviewedReplayCount ?? 0) >= 2 }
+    var reviewedSlowPlays: Int { reviewedSlowCount ?? min(slowReplays, reviewedReplayCount ?? 0) }
+    var isSuggested: Bool {
+        replays - (reviewedReplayCount ?? 0) >= 2 || (source.mode == .text && slowReplays > reviewedSlowPlays)
+    }
+    var needsReview: Bool { isMarked || isSuggested }
 
     var reference: AssistantQuestionReference {
         AssistantQuestionReference(passage: passage, source: source)
@@ -83,6 +89,9 @@ struct ListeningMark: Codable, Identifiable {
 @MainActor
 @Observable
 final class ListeningMarks {
+    enum TextChange { case mark, slow, review }
+    @ObservationIgnored var onTextChange: ((ListeningMark, TextChange) -> Void)?
+
     private let file: URL
     private var entries: [ListeningMark] = []
     private(set) var issue: String?
@@ -120,7 +129,11 @@ final class ListeningMarks {
             marked.manuallyMarked = true
             next.append(marked)
         }
-        return save(next)
+        guard save(next) else { return false }
+        if let added = next.first(where: { $0.isSameSentence(as: mark) }), added.source.mode == .text {
+            onTextChange?(added, .mark)
+        }
+        return true
     }
 
     func recordReplay(_ target: ListeningTarget, speed: PlaybackSpeed) {
@@ -129,8 +142,13 @@ final class ListeningMarks {
         let index = next.firstIndex { $0.isSameSentence(as: mark) } ?? next.endIndex
         if index == next.endIndex { next.append(mark) }
         next[index].replayCount = next[index].replays + 1
-        if speed == .threeQuarters { next[index].slowReplayCount = next[index].slowReplays + 1 }
-        save(next)
+        if speed == .threeQuarters {
+            next[index].reviewedSlowCount = next[index].reviewedSlowPlays
+            next[index].slowReplayCount = next[index].slowReplays + 1
+        }
+        if save(next), speed == .threeQuarters, mark.source.mode == .text {
+            onTextChange?(next[index], .slow)
+        }
     }
 
     private func makeEntry(_ target: ListeningTarget) -> ListeningMark? {
@@ -153,7 +171,36 @@ final class ListeningMarks {
         guard let index = next.firstIndex(where: { $0.id == id }) else { return }
         next[index].manuallyMarked = false
         next[index].reviewedReplayCount = next[index].replays
-        save(next)
+        next[index].reviewedSlowCount = next[index].slowReplays
+        if save(next), next[index].source.mode == .text { onTextChange?(next[index], .review) }
+    }
+
+    func syncTextRows(_ rows: [ReadingMark], article: Article, key: String) throws {
+        var next = entries
+        var changed = false
+        for row in rows where row.anchor.matches(article.body) {
+            let range = NSRange(location: row.anchor.offset, length: row.anchor.length)
+            let source = AssistantQuestionSource(title: article.title, location: .text(material: key, range: range, pdf: article.pdfPage))
+            let reference = AssistantQuestionReference(passage: row.anchor.quote, source: source)
+            guard let candidate = makeEntry(.init(reference: reference)) else { continue }
+            let index = next.firstIndex {
+                $0.isSameSentence(as: candidate) ||
+                ($0.source.mode == .text && $0.source.materialID == key &&
+                 $0.source.positionID == source.positionID && $0.passage.hasPrefix(row.anchor.quote))
+            }
+            var mark = index.map { next[$0] } ?? candidate
+            guard (index == nil && (row.manuallyMarked || row.slowCount > 0)) ||
+                mark.isMarked != row.manuallyMarked || mark.slowReplays != row.slowCount ||
+                mark.reviewedSlowPlays != row.reviewedCount else { continue }
+            mark.manuallyMarked = row.manuallyMarked
+            mark.slowReplayCount = row.slowCount
+            mark.reviewedSlowCount = row.reviewedCount
+            if !row.needsReview { mark.reviewedReplayCount = mark.replays }
+            if let index { next[index] = mark }
+            else { next.append(mark) }
+            changed = true
+        }
+        if changed, !save(next) { throw ReaderError.message(issue ?? "无法同步听力标记。") }
     }
 
     func isMediaFavorite(_ target: ListeningTarget) -> Bool {
@@ -260,7 +307,7 @@ struct ListeningMarkSheet: View {
                                     if mark.isMarked { Text("手动标记") }
                                     if mark.isSuggested { Text("可能卡住") }
                                     Spacer()
-                                    Text("重听 \(mark.replays) 次 · 其中 0.75× \(mark.slowReplays) 次").monospacedDigit()
+                                    Text("重听 \(mark.replays) 次 · 慢速听过 \(mark.slowReplays) 次").monospacedDigit()
                                 }
                                 .font(.caption).foregroundStyle(ReaderPalette.muted)
                                 Text(passage(mark)).font(.title3).textSelection(.enabled)

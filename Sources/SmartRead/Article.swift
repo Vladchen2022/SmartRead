@@ -149,6 +149,7 @@ struct ArticleStore {
     let weeklyFavoriteQueueFile: URL
     let questionFavoritesFile: URL
     let listeningMarksFile: URL
+    let textSyncDirectory: URL
 
     init(root: URL = URL.applicationSupportDirectory.appending(path: "SmartRead", directoryHint: .isDirectory)) {
         file = root.appending(path: "CurrentArticle.json")
@@ -158,6 +159,7 @@ struct ArticleStore {
         weeklyFavoriteQueueFile = root.appending(path: "WeeklyFavoriteQueue.json")
         questionFavoritesFile = root.appending(path: "QuestionFavorites.json")
         listeningMarksFile = root.appending(path: "ListeningMarks.json")
+        textSyncDirectory = root.appending(path: "TextSync", directoryHint: .isDirectory)
     }
 
     enum RecordFile: String, CaseIterable, Identifiable {

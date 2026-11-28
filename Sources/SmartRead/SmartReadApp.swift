@@ -54,6 +54,13 @@ struct SmartReadApp: App {
                          mode: $mode, sheet: $sheet,
                          fontSize: $fontSize, choosesAudioFile: $choosesAudioFile, openPDF: openPDF)
                 .frame(minWidth: 760, minHeight: 560)
+                .task {
+                    while !Task.isCancelled {
+                        await reader.syncTextLibrary()
+                        do { try await Task.sleep(for: .seconds(8)) }
+                        catch { break }
+                    }
+                }
                 .onAppear {
                     application.importFile = { [reader, audioStudy] url in
                         if !(mode == .audio && AudioStudyFormat(url: url) != nil), VideoFile.isSupported(url) {
@@ -102,7 +109,7 @@ struct SmartReadApp: App {
                     if let sentence = reader.selectedPreviewSentence { speech.preview(sentence) }
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(mode != .text || reader.selectedPreviewSentence == nil || sheet != nil)
+                .disabled(mode != .text || speech.isBlindListening || reader.selectedPreviewSentence == nil || sheet != nil)
                 Button("翻译选区") { reader.lookUp(.translation) }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                     .disabled(mode != .text || !reader.hasEnglishSelection || sheet != nil)
@@ -257,6 +264,7 @@ struct ReaderWindow: View {
     @State private var dropTarget = false
     @State private var subtitleAssistant = AudioSubtitleAssistant()
     @State private var pendingMarkedSpeech: (version: UUID, sentence: TextExcerpt)?
+    @State private var revealedBlindSentence: TextExcerpt?
 
     private var interfaceScale: CGFloat { preferences.interfaceSize.scale }
     private static let brandIcon: NSImage? = {
@@ -271,6 +279,7 @@ struct ReaderWindow: View {
     }()
     private var inAudioMode: Bool { mode == .audio }
     private var inVideoMode: Bool { mode == .video }
+    private var isBlindListening: Bool { mode == .text && speech.isBlindListening }
 
     var body: some View {
         let article = reader.article
@@ -279,9 +288,23 @@ struct ReaderWindow: View {
             let width = geometry.size.width
             let layout = paneLayout(windowWidth: width, inspectorDelta: -dividerOffset)
             VStack(spacing: 0) {
-                toolbar(articleWidthPercent: layout.articleWidthPercent, windowWidth: width)
+                if isBlindListening {
+                    blindListeningToolbar
+                } else {
+                    toolbar(articleWidthPercent: layout.articleWidthPercent, windowWidth: width)
+                }
                 Rectangle().fill(ReaderPalette.rule).frame(height: 1)
-                columns(layout: layout, windowWidth: width, article: article, articleVersion: articleVersion)
+                if isBlindListening {
+                    Color.clear
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .overlay {
+                            if let current = speech.current, current == revealedBlindSentence {
+                                blindSentence(current)
+                            }
+                        }
+                } else {
+                    columns(layout: layout, windowWidth: width, article: article, articleVersion: articleVersion)
+                }
                 switch mode {
                 case .audio:
                     if audio.entry != nil {
@@ -289,7 +312,9 @@ struct ReaderWindow: View {
                     }
                 case .text:
                     if speech.current != nil {
-                        SpeechPlayerBar(speech: speech, captureMark: captureListeningMark, trackedReplay: trackedReplay)
+                        SpeechPlayerBar(speech: speech, close: endTextListening,
+                                        enterBlindListening: isBlindListening ? nil : enterBlindListening,
+                                        captureMark: captureListeningMark, trackedReplay: trackedReplay)
                     }
                 case .video:
                     VideoPlayerBar(model: video, controller: video.playerController,
@@ -315,13 +340,18 @@ struct ReaderWindow: View {
         .onChange(of: speech.error) { _, message in
             if mode == .text, speech.current == nil, let message { reader.notice = message }
         }
+        .onChange(of: speech.current) { _, current in
+            if revealedBlindSentence != current { revealedBlindSentence = nil }
+        }
         .onChange(of: audio.entry?.id) { subtitleAssistant.clear() }
         .onChange(of: showsSubtitles) {
             if !showsSubtitles { subtitleAssistant.clear() }
         }
         .onChange(of: mode) { previous, next in
             switch previous {
-            case .text: speech.pause()
+            case .text:
+                showListeningText()
+                speech.pause()
             case .audio: audio.pause(); dropTarget = false
             case .video: video.pauseForModeSwitch()
             }
@@ -398,9 +428,65 @@ struct ReaderWindow: View {
     }
 
     private func readingShortcut(_ shortcut: PlaybackShortcut) -> (() -> Void)? {
-        guard shortcut == .toggle, mode == .text, speech.current == nil,
-              sheet == nil, pdfBookPanel == nil, let sentence = reader.selectedPreviewSentence else { return nil }
+        guard mode == .text, sheet == nil, pdfBookPanel == nil else { return nil }
+        if shortcut == .toggleBlindSentence {
+            return isBlindListening ? toggleBlindSentence : nil
+        }
+        guard shortcut == .toggle, speech.current == nil, let sentence = reader.selectedPreviewSentence else { return nil }
         return { speech.preview(sentence) }
+    }
+
+    private var blindListeningToolbar: some View {
+        HStack(spacing: 12 * interfaceScale) {
+            Button(action: showListeningText) { Label("显示正文", systemImage: "eye") }
+                .accessibilityIdentifier("toggleBlindListening")
+            Button(revealedBlindSentence == nil ? "显示当前句" : "隐藏当前句", action: toggleBlindSentence)
+                .accessibilityIdentifier("toggleBlindSentence")
+                .help("切换当前句原文（\(PlaybackShortcut.toggleBlindSentence.hint)）")
+        }
+        .buttonStyle(ReaderButtonStyle(prominent: false, compact: true, scale: 1.65))
+        .padding(12 * interfaceScale)
+        .frame(maxWidth: .infinity)
+        .background(ReaderPalette.chrome)
+    }
+
+    private func blindSentence(_ sentence: TextExcerpt) -> some View {
+        GeometryReader { geometry in
+            ScrollView {
+                Text(verbatim: sentence.text)
+                    .font(.system(size: fontSize, design: .serif))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 820)
+                    .padding(32)
+                    .frame(maxWidth: .infinity, minHeight: geometry.size.height)
+                    .accessibilityIdentifier("blindCurrentSentence")
+            }
+        }
+    }
+
+    private func enterBlindListening() {
+        revealedBlindSentence = nil
+        speech.setBlindListening(true)
+    }
+
+    private func toggleBlindSentence() {
+        guard isBlindListening, let current = speech.current else { return }
+        revealedBlindSentence = revealedBlindSentence == current ? nil : current
+    }
+
+    private func showListeningText() {
+        guard speech.isBlindListening else { return }
+        revealedBlindSentence = nil
+        if let current = speech.current {
+            reader.didScroll(to: current.range.location)
+            reader.locate(current.range)
+        }
+        speech.setBlindListening(false)
+    }
+
+    private func endTextListening() {
+        showListeningText()
+        speech.stop()
     }
 
     private func paneLayout(windowWidth: CGFloat, inspectorDelta: CGFloat = 0) -> ReaderPaneLayout {
@@ -815,7 +901,7 @@ struct ReaderWindow: View {
                         return queried
                     },
                     onReadingPosition: { position, version, saveForResume in
-                        if mode == .text, reader.articleVersion == version {
+                        if mode == .text, !isBlindListening, reader.articleVersion == version {
                             reader.didScroll(to: position, saveForResume: saveForResume)
                         }
                     },

@@ -4,6 +4,7 @@ import PackageDescription
 let package = Package(
     name: "SmartRead",
     platforms: [.macOS(.v14)],
+    dependencies: [.package(path: "SyncCore")],
     targets: [
         .binaryTarget(
             name: "VLCKit",
@@ -11,7 +12,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "SmartRead",
-            dependencies: ["VLCKit"],
+            dependencies: ["VLCKit", .product(name: "SmartReadSync", package: "SyncCore")],
             resources: [
                 .copy("Resources/Readability.js"),
                 .copy("Resources/Readability-LICENSE.md"),
@@ -27,7 +28,7 @@ let package = Package(
                               "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
             ]
         ),
-        .testTarget(name: "SmartReadTests", dependencies: ["SmartRead", "VLCKit"],
+        .testTarget(name: "SmartReadTests", dependencies: ["SmartRead", "VLCKit", .product(name: "SmartReadSync", package: "SyncCore")],
                     resources: [.copy("Fixtures/VideoPlayback")],
                     linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../.."])])
     ]

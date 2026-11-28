@@ -38,7 +38,7 @@ final class SpeechTests: XCTestCase {
     }
 
     @MainActor
-    func testPlaybackShortcutsMatchOnlyUnmodifiedPlaybackKeys() throws {
+    func testPlaybackShortcutsMatchTheirExactModifiers() throws {
         func event(_ key: String, modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
             try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
                                          timestamp: 0, windowNumber: 0, context: nil, characters: key,
@@ -52,7 +52,8 @@ final class SpeechTests: XCTestCase {
         XCTAssertEqual(PlaybackShortcut(event: try event("\u{F700}", modifiers: [.numericPad, .function])), .toggleSpeed)
         XCTAssertNil(PlaybackShortcut(event: try event("\u{F700}", modifiers: [.command, .function])))
         XCTAssertNil(PlaybackShortcut(event: try event("\u{F701}", modifiers: [.command, .function])))
-        XCTAssertNil(PlaybackShortcut(event: try event("\u{F701}", modifiers: [.shift, .function])))
+        XCTAssertEqual(PlaybackShortcut(event: try event("\u{F701}", modifiers: [.shift, .function])), .toggleBlindSentence)
+        XCTAssertNil(PlaybackShortcut(event: try event("\u{F701}", modifiers: [.shift, .option])))
         XCTAssertNil(PlaybackShortcut(event: try event("r")))
         XCTAssertNil(PlaybackShortcut(event: try event("s")))
         XCTAssertNil(PlaybackShortcut(event: try event("s", modifiers: .command)))
@@ -60,6 +61,36 @@ final class SpeechTests: XCTestCase {
         XCTAssertNil(PlaybackShortcut(event: try event("a")))
         XCTAssertEqual(PlaybackShortcut(event: try event("m")), .markListening)
         XCTAssertNil(PlaybackShortcut(event: try event("m", modifiers: .command)))
+    }
+
+    @MainActor
+    func testBlindListeningPlaysWithoutWaitingForTextLayout() throws {
+        let suite = "SmartReadTests.BlindSpeech.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let speech = ReaderSpeech(defaults: defaults)
+        defer { speech.stop() }
+        let sentences = ReadingIndex("Start here. Then move on.").articleSentences()
+
+        speech.setBlindListening(true)
+        XCTAssertFalse(speech.isBlindListening)
+        speech.start(sentences, stopsAfterSentence: true)
+        XCTAssertEqual(speech.phase, .positioning)
+        speech.setBlindListening(true)
+        XCTAssertTrue(speech.isBlindListening)
+        XCTAssertEqual(speech.phase, .loading)
+
+        speech.move(1)
+        XCTAssertEqual(speech.current, sentences[1])
+        XCTAssertEqual(speech.focusRequest?.range, sentences[1].range)
+        XCTAssertEqual(speech.phase, .loading)
+
+        speech.setBlindListening(false)
+        speech.move(-1)
+        XCTAssertEqual(speech.phase, .positioning)
+        speech.setBlindListening(true)
+        speech.stop()
+        XCTAssertFalse(speech.isBlindListening)
     }
 
     @MainActor

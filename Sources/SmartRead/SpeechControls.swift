@@ -164,6 +164,8 @@ private struct SpeechOptionPicker<Value: Hashable>: View {
 
 struct SpeechPlayerBar: View {
     let speech: ReaderSpeech
+    let close: () -> Void
+    var enterBlindListening: (() -> Void)?
     var captureMark: (() -> (() -> Void)?)? = nil
     var trackedReplay: (() -> Void)? = nil
 
@@ -178,11 +180,18 @@ struct SpeechPlayerBar: View {
         return ReaderPlaybackBar(
             idPrefix: "speech", isPlaying: speech.isActive, status: speech.error ?? status, hasError: speech.error != nil,
             previous: previous, toggle: { speech.toggle() }, next: next,
-            replay: trackedReplay ?? { speech.replay() }, speedMenu: speedMenu, close: { speech.stop() }, captureMark: captureMark
+            replay: trackedReplay ?? { speech.replay() }, speedMenu: speedMenu, close: close, captureMark: captureMark
         ) {
             EmptyView()
         } accessory: {
-            EmptyView()
+            if let enterBlindListening {
+                Button(action: enterBlindListening) {
+                    Label("盲听", systemImage: "eye.slash")
+                }
+                .buttonStyle(ReaderButtonStyle(prominent: false, compact: true, scale: 1.65))
+                .accessibilityIdentifier("toggleBlindListening")
+                .help("隐藏正文和学习助手")
+            }
         }
     }
 
@@ -290,6 +299,7 @@ struct ReaderPlaybackBar<Progress: View, Accessory: View>: View {
         case .replay: replay
         case .toggleSpeed: speedMenu.isAvailable ? speedMenu.toggleSpeed : nil
         case .markListening: captureMark?()
+        case .toggleBlindSentence: nil
         }
     }
 

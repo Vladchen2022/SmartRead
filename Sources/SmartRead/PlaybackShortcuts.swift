@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum PlaybackShortcut: CaseIterable {
-    case previous, toggle, next, replay, toggleSpeed, markListening
+    case previous, toggle, next, replay, toggleSpeed, markListening, toggleBlindSentence
 
     var hint: String {
         switch self {
@@ -11,6 +11,7 @@ enum PlaybackShortcut: CaseIterable {
         case .replay: "↓"
         case .toggleSpeed: "↑"
         case .markListening: "M"
+        case .toggleBlindSentence: "⇧↓"
         }
     }
 
@@ -22,19 +23,26 @@ enum PlaybackShortcut: CaseIterable {
         case .replay: .downArrow
         case .toggleSpeed: .upArrow
         case .markListening: "m"
+        case .toggleBlindSentence: .downArrow
         }
     }
 
+    private var modifiers: NSEvent.ModifierFlags {
+        self == .toggleBlindSentence ? .shift : []
+    }
+
     init?(event: NSEvent) {
-        let modifiers: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
-        guard event.modifierFlags.intersection(modifiers).isEmpty,
-              let character = event.charactersIgnoringModifiers?.lowercased(),
-              let shortcut = Self.allCases.first(where: { String($0.key.character) == character }) else { return nil }
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        guard let character = event.charactersIgnoringModifiers?.lowercased(),
+              let shortcut = Self.allCases.first(where: {
+                  $0.modifiers == modifiers && String($0.key.character) == character
+              }) else { return nil }
         self = shortcut
     }
 }
 
 struct PlaybackShortcutMonitor: NSViewRepresentable {
+    @Environment(\.isEnabled) private var enabled
     let action: (PlaybackShortcut) -> (() -> Void)?
     var captureMark: (() -> (() -> Void)?)?
     var extraAction: ((NSEvent) -> (() -> Void)?)?

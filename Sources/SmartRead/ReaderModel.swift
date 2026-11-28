@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import Observation
+import SmartReadSync
 
 @MainActor
 @Observable
@@ -73,6 +74,14 @@ final class ReaderModel {
     private var cachedBookID: String?
     private let learningStore: LearningRecordStore
     private let importedLearning: ImportedLearningRecords
+    let textSync: ReadingSyncStore
+    private(set) var textSyncIssue: String?
+    private var textSyncScanned = false
+    private var textSyncRunning = false
+    private var applyingTextSync = false
+    private var lastTextSyncRevision: Int?
+    private var lastTextSyncMaterials: [String: (Article, ReadingMaterial)] = [:]
+    private var textSyncCatalogs: [String: [ReadingChapter]] = [:]
     private let backgroundLearningRecords: BackgroundLearningRecords?
     private let backgroundLegacyRecords: BackgroundLearningRecords
     @ObservationIgnored private var learningRecordTask: Task<Void, Never>?
@@ -94,6 +103,7 @@ final class ReaderModel {
         self.pdfBooks = PDFBookStore(root: store.pdfBooksDirectory)
         self.learningStore = learningStore
         self.importedLearning = ImportedLearningRecords(root: store.importedLearningDirectory)
+        self.textSync = ReadingSyncStore(root: store.textSyncDirectory)
         self.weeklyFavorites = WeeklyFavoriteSync(defaults: defaults, queueFile: store.weeklyFavoriteQueueFile)
         self.backgroundLegacyRecords = BackgroundLearningRecords(store: learningStore)
         self.backgroundLearningRecords = loadsLearningRecordsInBackground ? BackgroundLearningRecords(store: learningStore) : nil
@@ -116,6 +126,7 @@ final class ReaderModel {
         catch { recoveryNeeded.insert(.positions) }
         if !recoveryNeeded.isEmpty { notice = "读取资料失败。请打开「历史记录」恢复，原文件已保留。" }
         restoreReadingPosition()
+        self.listeningMarks.onTextChange = { [weak self] mark, kind in self?.publishTextMark(mark, kind: kind) }
     }
 
     func recover(_ kind: ArticleStore.RecordFile) throws {
@@ -226,12 +237,12 @@ final class ReaderModel {
     }
 
     func importText(_ text: String, title: String) throws {
-        try adopt(Article.pasted(text, title: title))
+        try adopt(Article.pasted(text, title: title), reimporting: true)
     }
 
     func importFile(_ url: URL) throws {
         let imported = try importer.textFile(url, relativePath: learningStore.sourcePath(for: url))
-        try adopt(imported, refreshLearningSource: true)
+        try adopt(imported, refreshLearningSource: true, reimporting: true)
     }
 
     func importPDFBook(_ url: URL) async throws {
@@ -244,13 +255,13 @@ final class ReaderModel {
         guard version == articleVersion else { throw CancellationError() }
         if let existing = ([library.current].compactMap { $0 } + history.map(\.article))
             .first(where: { $0.pdfPage?.book.id == book.id }) {
-            try adopt(existing)
+            try adopt(existing, reimporting: true)
             return
         }
         guard let page = try await pdfBooks.article(for: book, at: 0, englishOnly: false) else { return }
         try Task.checkCancellation()
         guard version == articleVersion else { throw CancellationError() }
-        try adopt(page)
+        try adopt(page, reimporting: true)
     }
 
     func turnPDFPage(_ direction: Int) async {
@@ -393,15 +404,19 @@ final class ReaderModel {
     }
 
     func deleteHistoryArticle(_ id: UUID) throws {
+        let removed = history.filter { $0.id == id }.map(\.article)
         var next = library
         next.history.removeAll { $0.id == id }
         try saveLibrary(next)
+        rememberLocalHistoryRemoval(removed)
     }
 
     func clearHistory() throws {
+        let removed = history.map(\.article)
         var next = library
         next.history.removeAll()
         try saveLibrary(next)
+        rememberLocalHistoryRemoval(removed)
     }
 
     func importLink(_ address: String) async throws {
@@ -410,7 +425,7 @@ final class ReaderModel {
         do {
             let imported = try await importer.webpage(address)
             try Task.checkCancellation()
-            try adopt(imported)
+            try adopt(imported, reimporting: true)
         } catch let error as URLError where error.code != .cancelled {
             throw ReaderError.message("网页请求失败。请在浏览器打开原文后，复制正文导入。")
         }
@@ -678,12 +693,17 @@ final class ReaderModel {
             try importedLearning.save(next, for: target)
             updateBookLearningRecord(next)
         }
+        publishTextFavorite(favorite, removed: false, in: target)
+        if let originalID, let original = record.favorites.first(where: { $0.id == originalID }) {
+            publishTextFavorite(original, removed: true, in: target)
+        }
         if let originalID, next.sourceId == nil { weeklyFavorites.discardPending(favoriteID: originalID) }
     }
 
     func removeFavorite(_ id: String) throws {
         guard let source = favoriteRecord(containing: id),
               let index = source.record.favorites.firstIndex(where: { $0.id == id }) else { return }
+        let target = source.record.articleId == learningRecord?.articleId ? article : try source.record.pdfArticle()
         var next = source.record
         next.favorites.remove(at: index)
         _ = next.touch()
@@ -696,6 +716,7 @@ final class ReaderModel {
         }
         if next.sourceId == nil { weeklyFavorites.discardPending(favoriteID: id) }
         if shownFavorite?.id == id { shownFavorite = nil }
+        publishTextFavorite(source.favorite, removed: true, in: target)
     }
 
     func showFavorite(_ id: String) throws {
@@ -1132,6 +1153,13 @@ final class ReaderModel {
         do {
             try store.savePositions(positions)
             savedPositions = positions
+            if textSync.folderName != nil, !applyingTextSync, let current = library.current {
+                do {
+                    let material = try textSyncMaterial(current)
+                    try textSync.record([.material(material), .progress(material: material.id, .init(
+                        offset: position.sentenceStart, chapterOffset: position.chapterOffset, completed: position.completed))])
+                } catch { textSyncIssue = error.localizedDescription }
+            }
             return true
         } catch {
             recoveryNeeded.insert(.positions)
@@ -1413,11 +1441,25 @@ final class ReaderModel {
         return result
     }
 
-    private func adopt(_ next: Article, refreshLearningSource: Bool = false) throws {
+    private func adopt(_ next: Article, refreshLearningSource: Bool = false, reimporting: Bool = false) throws {
         var updated = library
         updated.open(next)
+        updated.history.removeAll { entry in
+            textHistoryKey(for: entry.article).map(textSync.isHiddenFromHistory) ?? false
+        }
         try saveLibrary(updated)
         display(next, refreshLearningSource: refreshLearningSource)
+        if !applyingTextSync, textSync.folderName != nil {
+            do {
+                if reimporting, let key = textHistoryKey(for: next) {
+                    // Persist earlier removals before explicitly showing this item again.
+                    try publishHistoryRemovals()
+                    try textSync.setHistoryHidden(false, keys: [key])
+                }
+                try seedTextMaterial(next, lastRead: .now, includesStartingPosition: true)
+            } catch { textSyncIssue = error.localizedDescription }
+            Task { await syncTextLibrary() }
+        }
     }
 
     private func display(_ next: Article, refreshLearningSource: Bool) {
@@ -1544,5 +1586,316 @@ final class ReaderModel {
         var error: String?
         var isLoading = false
         var answerRevealed = false
+    }
+}
+
+extension ReaderModel {
+    private struct SyncedArticleMetadata: Codable {
+        let byline: String?
+        let course: LearningArticleSource?
+        let pdf: PDFBookLocation?
+    }
+
+    func connectTextSync(to folder: URL) async {
+        do {
+            try textSync.connect(to: folder)
+            textSyncScanned = false
+            await syncTextLibrary()
+        } catch { textSyncIssue = error.localizedDescription }
+    }
+
+    func syncTextLibrary(force: Bool = false) async {
+        guard textSync.folderName != nil, !textSyncRunning else { return }
+        textSyncRunning = true
+        defer { textSyncRunning = false }
+        var localIssue: Error?
+        do { try publishHistoryRemovals() }
+        catch { localIssue = error }
+        if !textSyncScanned {
+            let current = library.current
+            let articles = [current].compactMap { $0 } + history.map(\.article)
+            if let current {
+                do { try seedTextMaterial(current, lastRead: .now, includesStartingPosition: true) }
+                catch { localIssue = error }
+            }
+            for entry in history {
+                do { try seedTextMaterial(entry.article, lastRead: entry.lastReadAt) }
+                catch { localIssue = error }
+            }
+            let books = Dictionary(articles.compactMap { $0.pdfPage?.book }.map { ($0.id, $0) },
+                                   uniquingKeysWith: { first, _ in first })
+            for book in books.values {
+                do {
+                    for record in try importedLearning.records(for: book) {
+                        do { try seedTextMaterial(record.pdfArticle(), record: record) }
+                        catch { localIssue = error }
+                    }
+                    if let chapters = try? await pdfBooks.chapters(for: book) {
+                        try publishTextChapterCatalog(chapters, bookID: book.id)
+                    }
+                } catch { localIssue = error }
+            }
+            textSyncScanned = localIssue == nil && recoveryNeeded.isEmpty
+        }
+        await textSync.sync(force: force)
+        do {
+            if lastTextSyncRevision != textSync.revision {
+                applyingTextSync = true
+                defer { applyingTextSync = false }
+                try applyTextSync()
+                lastTextSyncRevision = textSync.revision
+            }
+            textSyncIssue = localIssue?.localizedDescription
+        } catch { textSyncIssue = error.localizedDescription }
+    }
+
+    var remoteReadingMaterial: ReadingMaterial? {
+        textSync.materials.compactMap { material in
+            textSync.remoteProgress(for: material.id).map { (material, $0.date) }
+        }.filter { $0.1 != .distantPast }.max { $0.1 < $1.1 }?.0
+    }
+
+    func openRemoteReadingMaterial() {
+        guard let material = remoteReadingMaterial else { return }
+        do {
+            try applyTextSync()
+            try adopt(decodedTextMaterial(material))
+        } catch { textSyncIssue = error.localizedDescription }
+    }
+
+    func shareCurrentPDFChapters() async {
+        guard let location = article.pdfPage, textSync.folderName != nil else { return }
+        do {
+            let chapters = try await pdfBooks.chapters(for: location.book)
+            try publishTextChapterCatalog(chapters, bookID: location.book.id)
+            for chapter in chapters {
+                try Task.checkCancellation()
+                let item = try await pdfBooks.chapterArticle(for: location.book, chapter: chapter,
+                                                            englishOnly: location.englishOnly)
+                try seedTextMaterial(item)
+            }
+            await syncTextLibrary()
+        } catch is CancellationError {
+        } catch { textSyncIssue = error.localizedDescription }
+    }
+
+    private func publishTextChapterCatalog(_ chapters: [PDFChapter], bookID: String) throws {
+        guard !chapters.isEmpty else { return }
+        let catalog = chapters.map { ReadingChapter(page: $0.firstPage + 1, title: $0.menuLabel) }
+        textSyncCatalogs[bookID] = catalog
+        let changed = textSync.materials.filter { $0.bookID == bookID && $0.chapterCatalog != catalog }.map { item in
+            var updated = item
+            updated.chapterCatalog = catalog
+            return ReadingSyncValue.material(updated)
+        }
+        try textSync.record(changed)
+    }
+
+    private func textSyncMaterial(_ article: Article) throws -> ReadingMaterial {
+        let key = SavedReadingPosition.key(for: article)
+        let catalog = article.pdfPage.flatMap { textSyncCatalogs[$0.book.id] }
+        if let (cached, material) = lastTextSyncMaterials[key], cached == article,
+           material.chapterCatalog == catalog {
+            return material
+        }
+        var material = try ReadingMaterial(title: article.title, body: article.body, legacyKey: key)
+        material.sourceURL = article.sourceURL
+        let metadata = SyncedArticleMetadata(byline: article.byline, course: article.learningSource, pdf: article.pdfPage)
+        if article.byline != nil || article.learningSource != nil || article.pdfPage != nil {
+            material.desktopMetadata = try JSONEncoder().encode(metadata)
+        }
+        material.bookID = article.pdfPage?.book.id
+        material.page = article.pdfPage.map { $0.index + 1 }
+        material.chapter = article.pdfPage?.chapter?.chapter.menuLabel
+        material.chapterTranslation = article.pdfPage?.chapter?.translation
+        material.chapterCatalog = catalog
+        lastTextSyncMaterials[key] = (article, material)
+        return material
+    }
+
+    private func decodedTextMaterial(_ material: ReadingMaterial) throws -> Article {
+        let metadata = try material.desktopMetadata.map { try JSONDecoder().decode(SyncedArticleMetadata.self, from: $0) }
+        let item = try Article(title: material.title, body: material.body, sourceURL: material.sourceURL, byline: metadata?.byline,
+                               learningSource: metadata?.course, pdfPage: metadata?.pdf)
+        let id = try ReadingMaterial(title: item.title, body: item.body, legacyKey: SavedReadingPosition.key(for: item)).id
+        guard material.id == id else { throw ReadingSyncError.invalidSnapshot }
+        return item
+    }
+
+    private func seedTextMaterial(_ article: Article, record supplied: LearningRecord? = nil,
+                                  lastRead: Date = .distantPast, includesStartingPosition: Bool = false) throws {
+        guard !article.body.isEmpty else { return }
+        let material = try textSyncMaterial(article)
+        var values: [ReadingSyncValue] = [.material(material)]
+        if let position = savedPositions[material.legacyKey],
+           (position.chapterOffset ?? position.sentenceStart) < article.body.utf16.count {
+            values.append(.progress(material: material.id,
+                                    .init(offset: position.sentenceStart, chapterOffset: position.chapterOffset,
+                                          completed: position.completed, date: lastRead)))
+        } else if includesStartingPosition {
+            values.append(.progress(material: material.id, .init(offset: 0, completed: false, date: lastRead)))
+        }
+        try textSync.record(values, seed: true)
+        values.removeAll(keepingCapacity: true)
+
+        let record = try supplied ?? textLearningRecord(for: article)
+        values += (record?.favorites ?? []).compactMap { favorite in
+            guard let item = syncFavorite(favorite, in: article) else { return nil }
+            return .favorite(material: material.id, id: item.id, item)
+        }
+        let group = article.pdfPage.map { "book:" + $0.book.id } ?? material.legacyKey
+        let marks = listeningMarks.rows(for: .text, materialID: group)
+        let synchronizedMarks = Set(textSync.marks(for: material.id).map(\.id))
+        for mark in marks {
+            guard case .text(let key, let range, _) = mark.source.location, key == material.legacyKey else { continue }
+            let anchor = ReadingAnchor(offset: range.location, length: range.length, quote: mark.passage)
+            guard anchor.matches(article.body) else { continue }
+            values.append(.mark(material: material.id, anchor, mark.isMarked))
+            if mark.slowReplays > 0, !synchronizedMarks.contains("\(range.location):\(range.length)") {
+                values.append(.slow(material: material.id, anchor, device: textSync.device, count: mark.slowReplays))
+                values.append(.reviewed(material: material.id, anchor, seen: [textSync.device: mark.reviewedSlowPlays]))
+            }
+        }
+        try textSync.record(values, seed: true)
+    }
+
+    private func syncFavorite(_ item: LearningFavorite, in article: Article) -> ReadingFavorite? {
+        let anchor = ReadingAnchor(offset: item.range.location, length: item.range.length, quote: item.selectedText)
+        guard anchor.matches(article.body) else { return nil }
+        return ReadingFavorite(kind: item.kind.rawValue, anchor: anchor, sentence: item.sentence,
+                               definition: item.result.definition, translation: item.result.translation,
+                               analysis: item.result.analysis, date: item.createdAt)
+    }
+
+    private func textLearningRecord(for article: Article) throws -> LearningRecord? {
+        if article.learningSource == nil { return try importedLearning.load(for: article) }
+        return try learningStore.load(for: article)
+    }
+
+    private func publishTextFavorite(_ favorite: LearningFavorite, removed: Bool, in article: Article) {
+        guard textSync.folderName != nil, let item = syncFavorite(favorite, in: article) else { return }
+        do {
+            let material = try textSyncMaterial(article)
+            try textSync.record([.material(material), .favorite(material: material.id, id: item.id, removed ? nil : item)])
+        } catch { textSyncIssue = error.localizedDescription }
+    }
+
+    private func publishTextMark(_ mark: ListeningMark, kind: ListeningMarks.TextChange) {
+        guard textSync.folderName != nil, case .text(let key, let range, _) = mark.source.location else { return }
+        do {
+            guard let material = try (key == positionKey ? textSyncMaterial(article) : lastTextSyncMaterials[key]?.1) else { return }
+            let anchor = ReadingAnchor(offset: range.location, length: range.length, quote: mark.passage)
+            guard anchor.matches(material.body) else { return }
+            try textSync.record([.material(material)])
+            switch kind {
+            case .mark: try textSync.record([.mark(material: material.id, anchor, true)])
+            case .slow: try textSync.countSlow(material: material.id, anchor: anchor)
+            case .review: try textSync.removeMark(material: material.id, anchor: anchor)
+            }
+        } catch { textSyncIssue = error.localizedDescription }
+    }
+
+    private func applyTextSync() throws {
+        var nextLibrary = library
+        var libraryChanged = false
+        var positions = savedPositions
+        let materials = textSync.materials.sorted {
+            (textSync.progress(for: $0.id)?.date ?? .distantPast) > (textSync.progress(for: $1.id)?.date ?? .distantPast)
+        }
+        var seenPositions: Set<String> = []
+        nextLibrary.history.removeAll { entry in
+            textHistoryKey(for: entry.article).map(textSync.isHiddenFromHistory) ?? false
+        }
+        libraryChanged = nextLibrary.history.count != library.history.count
+        for material in materials {
+            let item = try decodedTextMaterial(material)
+            if let reading = textSync.progress(for: material.id),
+               reading.offset >= 0, reading.offset < item.body.utf16.count,
+               reading.chapterOffset.map({ $0 >= 0 && $0 < item.body.utf16.count }) ?? true,
+               lastTextSyncMaterials[material.legacyKey].map({ $0.1.id == material.id }) ?? true,
+               seenPositions.insert(material.legacyKey).inserted {
+                positions[material.legacyKey] = SavedReadingPosition(sentenceStart: reading.offset, completed: reading.completed,
+                                                                    chapterOffset: reading.chapterOffset)
+            }
+            if textSync.receivedMaterial(material.id),
+               nextLibrary.current?.matchesReadingItem(item) != true,
+               !nextLibrary.history.contains(where: { $0.article.matchesReadingItem(item) }) {
+                nextLibrary.history.insert(ArticleHistoryEntry(article: item,
+                    lastReadAt: textSync.progress(for: material.id)?.date ?? .now), at: 0)
+                libraryChanged = true
+            }
+            try listeningMarks.syncTextRows(textSync.marks(for: material.id), article: item, key: material.legacyKey)
+            try applyTextFavorites(for: item, material: material.id)
+        }
+        if positions != savedPositions, !recoveryNeeded.contains(.positions) {
+            try store.savePositions(positions)
+            savedPositions = positions
+        }
+        if libraryChanged {
+            nextLibrary.history.sort { $0.lastReadAt > $1.lastReadAt }
+            try saveLibrary(nextLibrary)
+        }
+    }
+
+    private func textHistoryKey(for article: Article) -> String? {
+        if let book = article.pdfPage?.book { return "book/" + book.id }
+        return try? textSyncMaterial(article).historyKey
+    }
+
+    private func rememberLocalHistoryRemoval(_ articles: [Article]) {
+        let keys = articles.compactMap(textHistoryKey(for:))
+        guard !keys.isEmpty else { return }
+        let queued = defaults.stringArray(forKey: "textSyncPendingHistoryRemovals") ?? []
+        defaults.set(Array(Set(queued + keys)).sorted(), forKey: "textSyncPendingHistoryRemovals")
+        Task { await syncTextLibrary() }
+    }
+
+    private func publishHistoryRemovals() throws {
+        let legacy = defaults.stringArray(forKey: "textSyncHiddenHistory") ?? []
+        if !legacy.isEmpty, !recoveryNeeded.contains(.library) {
+            let stillPresent = Set(([library.current].compactMap { $0 } + history.map(\.article))
+                .compactMap(textHistoryKey(for:)))
+            let keysByID = Dictionary(uniqueKeysWithValues: textSync.allMaterials.map { ($0.id, $0.historyKey) })
+            let removed = Set(legacy.map { keysByID[$0] ?? "article/" + $0 }).subtracting(stillPresent)
+            try textSync.setHistoryHidden(true, keys: removed, seed: true)
+            defaults.removeObject(forKey: "textSyncHiddenHistory")
+        }
+        let pending = defaults.stringArray(forKey: "textSyncPendingHistoryRemovals") ?? []
+        if !pending.isEmpty {
+            try textSync.setHistoryHidden(true, keys: Set(pending))
+            defaults.removeObject(forKey: "textSyncPendingHistoryRemovals")
+        }
+    }
+
+    private func applyTextFavorites(for article: Article, material: String) throws {
+        let additions = textSync.favorites(for: material)
+        let removals = textSync.removedFavorites(for: material)
+        guard !additions.isEmpty || !removals.isEmpty else { return }
+        var record = try textLearningRecord(for: article) ?? LearningRecord(article: article, now: .now)
+        let count = record.favorites.count
+        record.favorites.removeAll { removals.contains("\($0.kind.rawValue):\($0.range.location):\($0.range.length)") }
+        var changed = record.favorites.count != count
+        for item in additions {
+            guard item.anchor.matches(article.body), let kind = LearningFavorite.Kind(rawValue: item.kind) else { continue }
+            let range = NSRange(location: item.anchor.offset, length: item.anchor.length)
+            let id = LearningFavorite.id(articleId: record.articleId, kind: kind, range: range)
+            let result = LearningFavorite.Result(definition: item.definition, translation: item.translation, analysis: item.analysis)
+            let existing = record.favorites.firstIndex { $0.id == id }
+            if let existing, record.favorites[existing].result == result { continue }
+            let body = (article.body as NSString).substring(with: range)
+            let paragraph = ReadingIndex(article.body).favoriteContext(for: range)?.paragraph ?? 1
+            let next = LearningFavorite(favoriteId: id, kind: kind, selectedText: body, sentence: item.sentence,
+                                        paragraph: paragraph, range: .init(range), result: result,
+                                        createdAt: item.date, updatedAt: item.date)
+            if let existing { record.favorites[existing] = next }
+            else { record.favorites.append(next) }
+            changed = true
+        }
+        guard changed else { return }
+        _ = record.touch()
+        if article.learningSource == nil { try importedLearning.save(record, for: article) }
+        else { try learningStore.save(record) }
+        if article == self.article { learningRecord = record }
+        updateBookLearningRecord(record)
     }
 }

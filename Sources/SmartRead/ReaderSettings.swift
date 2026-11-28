@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum ReaderInterfaceSize: Int, CaseIterable {
     case compact = 65
@@ -59,11 +60,13 @@ struct ReaderSettings: View {
     let speech: ReaderSpeech
     let video: VideoStudyModel
     @State private var tab: Tab = .reading
+    @State private var choosesSyncFolder = false
+    @State private var sharesPDF = false
     @AppStorage(ReaderTheme.preferenceKey) private var theme: ReaderTheme = .white
     private var preferences = ReaderPreferences()
 
     private enum Tab: Hashable {
-        case reading, listening, video, model
+        case reading, listening, sync, video, model
     }
 
     var body: some View {
@@ -74,6 +77,9 @@ struct ReaderSettings: View {
             listening
                 .tabItem { Label("听读", systemImage: "speaker.wave.2") }
                 .tag(Tab.listening)
+            textSync
+                .tabItem { Label("设备同步", systemImage: "arrow.trianglehead.clockwise") }
+                .tag(Tab.sync)
             VideoStudySettings(model: video)
                 .tabItem { Label("视频精学", systemImage: "play.rectangle") }
                 .tag(Tab.video)
@@ -85,6 +91,45 @@ struct ReaderSettings: View {
         .scrollContentBackground(.hidden)
         .background(ReaderPalette.dialog)
         .onChange(of: theme) { _, selected in selected.apply() }
+    }
+
+    private var textSync: some View {
+        Form {
+            Section("同步文件夹") {
+                Button(reader.textSync.folderName ?? "选择 iCloud Drive 文件夹", systemImage: "folder") {
+                    choosesSyncFolder = true
+                }
+                .accessibilityIdentifier("chooseSyncFolder")
+                Text("在 iPhone 和 iPad 上选择同一个文件夹。选择后，文本阅读资料会自动同步。")
+                    .foregroundStyle(.secondary)
+                if reader.textSync.folderName != nil {
+                    Button("立即同步") { Task { await reader.syncTextLibrary(force: true) } }
+                        .disabled(reader.textSync.isSyncing)
+                    if let date = reader.textSync.lastSync {
+                        LabeledContent("上次检查", value: date.formatted(date: .omitted, time: .shortened))
+                    }
+                    if let material = reader.remoteReadingMaterial {
+                        Button("继续读《\(material.displayTitle)》") { reader.openRemoteReadingMaterial() }
+                    }
+                    if reader.article.pdfPage != nil {
+                        Button(sharesPDF ? "正在提取章节…" : "同步当前 PDF 的全部章节") {
+                            sharesPDF = true
+                            Task {
+                                await reader.shareCurrentPDFChapters()
+                                sharesPDF = false
+                            }
+                        }.disabled(sharesPDF)
+                    }
+                }
+                if let message = reader.textSyncIssue ?? reader.textSync.error {
+                    Text(message).foregroundStyle(.red)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .fileImporter(isPresented: $choosesSyncFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let folder) = result { Task { await reader.connectTextSync(to: folder) } }
+        }
     }
 
     private var reading: some View {

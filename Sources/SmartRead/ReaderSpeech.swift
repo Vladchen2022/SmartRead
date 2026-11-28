@@ -49,6 +49,7 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
     private(set) var waitingForNext = false
     private(set) var lastSpoken: TextExcerpt?
     private(set) var isPreviewing = false
+    private(set) var isBlindListening = false
     private var sentences: [TextExcerpt] = []
     private var selectionContinuation: [TextExcerpt] = []
 
@@ -131,6 +132,7 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
 
     func stop() {
         isPreviewing = false
+        isBlindListening = false
         cancelOutput()
         sentences = []
         lastSpoken = nil
@@ -140,6 +142,12 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
         focusRequest = nil
         singleSentence = false
         waitingForNext = false
+    }
+
+    func setBlindListening(_ enabled: Bool) {
+        guard enabled != isBlindListening, !enabled || current != nil else { return }
+        isBlindListening = enabled
+        if enabled, let focusRequest { focusArrived(focusRequest.id) }
     }
 
     func toggle() {
@@ -193,8 +201,10 @@ final class ReaderSpeech: NSObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDe
         guard let current else { return }
         waitingForNext = false
         error = nil
-        focusRequest = FocusRequest(range: current.range)
+        let request = FocusRequest(range: current.range)
+        focusRequest = request
         phase = .positioning
+        if isBlindListening { focusArrived(request.id) }
     }
 
     func focusArrived(_ id: UUID) {
